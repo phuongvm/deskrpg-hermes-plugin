@@ -108,18 +108,19 @@ SPEC = (
             "kanban_db_path",
             "board_dir",
             "AttachmentTooLarge",
-            "_retry_status_for_run",
-            "_parents_satisfied",
-            "_end_run",
             "invalidate_descendants_for_parent_reopen",
             "recompute_ready",
+            # Public verbs the upstream dashboard uses — they replace the underscore internals and direct SQL
+            # this list used to require.
+            "unsatisfied_parents",
+            "promote_task",
+            "edit_task",
         ),
     ),
-    ("hermes_cli.kanban_db_dispatch", ("dispatch_once", "_terminate_reclaimed_worker")),
+    ("hermes_cli.kanban_db_dispatch", ("dispatch_once",)),
     ("hermes_cli.kanban_specify", ("specify_task",)),
     ("hermes_cli.kanban_decompose", ("decompose_task",)),
     ("hermes_cli.kanban_diagnostics", ("compute_task_diagnostics", "config_from_runtime_config")),
-    ("hermes_cli.kanban", ("_check_dispatcher_presence",)),
     ("hermes_cli.config", ("load_config", "save_config")),
     ("hermes_constants", ("set_hermes_home_override", "reset_hermes_home_override", "get_hermes_home")),
     ("hermes_time", ("get_timezone",)),
@@ -157,6 +158,11 @@ SPEC = (
 # 않으므로 반쯤 되는 상태가 생기지 않는다. 반대로 이걸 `SPEC` 에 넣으면 `kanban_swarm`
 # 이 없는 구버전 Hermes 에서 칸반·크론까지 전부 죽는다.
 OPTIONAL_SPEC = (
+    # Hermes internals with no public replacement. Upstream can move them at any time, so the plugin must still
+    # load without them: a missing probe drops only the "dispatcher missing" warning, and a missing terminator
+    # only refuses reopening a finished card whose descendants are running (kanban_board._write_status).
+    ("hermes_cli.kanban", ("_check_dispatcher_presence",)),
+    ("hermes_cli.kanban_db_dispatch", ("_terminate_reclaimed_worker",)),
     ("hermes_cli.kanban_review_policy", ("API_VERSION", "get_review_state", "approve_task",
         "update_review_policy", "guard_task_mutation", "patch_review_task")),
     # 계획 B — 디바이스 코드 로그인. 대시보드 라우터 모듈이라 fastapi 가 없는 빌드에서는 통째로 빠진다.
@@ -172,6 +178,13 @@ OPTIONAL_SPEC = (
     # 계획 B — OAuth 가 default 를 None(=프로세스 홈)으로 넘겨도 되는지 본다. 없으면 default 의 앱 안 로그인만 거절된다.
     ("hermes_constants", ("get_process_hermes_home",)),
     ("hermes_cli.kanban_swarm", ("create_swarm", "latest_blackboard", "SwarmWorkerSpec")),
+    # Swarm on an approval-policy board: the plugin assembles the swarm in one transaction so every result card
+    # gets its policy before any worker can be dispatched (kanban_swarm_policy.py). These are Hermes internals;
+    # the `swarm_review_policy` capability is announced only when all of them are present with the expected
+    # signatures (contract_fields.has_swarm_policy_symbols).
+    ("hermes_cli.kanban_swarm", ("_create_swarm_uncommitted", "_activate_root_inline")),
+    ("hermes_cli.kanban_review_policy", ("create_policy", "inherited_policy")),
+    ("hermes_cli.kanban_db", ("latest_run", "_fire_kanban_lifecycle_hook")),
     # 0.7.1 — 대시보드 공개 주소. 없는 빌드는 `/deskrpg/info` 의 dashboard_url 만 null 이 된다.
     ("hermes_cli.dashboard_auth.prefix", ("resolve_public_url",)),
     # 0.9.0 — 직원 설정 피커. 없는 빌드는 그 라우트와 capability 만 빠진다.
@@ -227,17 +240,46 @@ OPTIONAL_SPEC = (
     ("tools.skills_hub_install", ("quarantine_bundle",)),
     ("tools.skills_guard", ("scan_skill", "should_allow_install")),
     ("hermes_cli.web_server_gateway", ("_profile_action_environment", "_dashboard_spawn_executable")),
+    # 0.17.0 — NPC MCP 커넥터 관리. 전부 있을 때만 profile_mcp_admin 을 알린다(contract_fields).
+    # 모듈 간 흔한 이름(start·registry·list_catalog …)은 `(원래 이름, 평면 이름)` 쌍으로 별칭을 준다.
+    ("hermes_cli.mcp_config", (
+        "_get_mcp_servers", "_save_mcp_server", "_remove_mcp_server", "_env_key_for_server",
+        "_bearer_auth_headers", "_oauth_tokens_present", "redact_mcp_probe_text",
+        "_resolve_mcp_server_config",
+    )),
+    ("hermes_cli.mcp_security", ("validate_mcp_server_entry",)),
+    ("tools.mcp_tool_loop", ("_ensure_mcp_loop", "_run_on_mcp_loop")),
+    ("tools.mcp_tool_discovery", ("_connect_server", "discover_mcp_tools")),
+    ("tools.mcp_tool_lifecycle", ("_stop_mcp_loop_if_idle", "shutdown_mcp_servers")),
+    ("tools.mcp_tool_agent", ("reprobe_tool_availability",)),
+    ("tools.registry", (("registry", "mcp_registry"),)),
+    ("gateway.run", ("_profile_runtime_scope",)),
+    ("hermes_cli.mcp_catalog", (
+        ("list_catalog", "mcp_list_catalog"), ("get_entry", "mcp_get_catalog_entry"),
+        ("card_install_config", "mcp_card_install_config"),
+    )),
+    ("tools.connectors.mcp_oauth", (("start", "mcp_oauth_start"), ("cancel_attempt", "mcp_oauth_cancel_attempt"))),
+    ("tui_gateway.mcp_oauth_sessions", ("deliver_callback_flow", "poll_flow", "cancel_flow")),
+    # 0.18.0 — 무인 실행 막힘 사건. 막힌 명령의 위험 패턴 키를 다시 계산하고, 명령을 가려서 싣는다.
+    # 없어도 사건은 남는다(패턴·명령만 빠진다) — capability 판정에 넣지 않는다.
+    ("tools.approval_detection", ("detect_dangerous_command",)),
+    ("agent.redact", ("redact_sensitive_text",)),
 )
 
-REQUIRED = tuple(name for _module, names in SPEC for name in names)
-OPTIONAL = tuple(name for _module, names in OPTIONAL_SPEC for name in names)
+def _pairs(names):
+    """`"name"` 또는 `("원래 이름", "평면 이름")` 을 `(src, dst)` 쌍으로 푼다."""
+    return [(n, n) if isinstance(n, str) else n for n in names]
+
+
+REQUIRED = tuple(dst for _module, names in SPEC for _src, dst in _pairs(names))
+OPTIONAL = tuple(dst for _module, names in OPTIONAL_SPEC for _src, dst in _pairs(names))
 
 
 def _assert_no_duplicate_names():
     # 평면 네임스페이스라 이름이 겹치면 한쪽이 조용히 다른 쪽을 덮는다 — import 시점에 막는다.
     seen = set()
     for _module, names in (*SPEC, *OPTIONAL_SPEC):
-        for name in names:
+        for _src, name in _pairs(names):
             if name in seen:
                 raise AssertionError(f"duplicate name in _hermes_api.SPEC: {name}")
             seen.add(name)
@@ -258,11 +300,11 @@ def load() -> types.SimpleNamespace:
             module = importlib.import_module(module_path)
         except Exception as exc:  # ImportError 뿐 아니라 초기화 실패도 잡는다
             raise MissingHermesApi(f"{module_path} cannot be imported: {exc!r}") from exc
-        for name in names:
-            value = getattr(module, name, None)
+        for src, dst in _pairs(names):
+            value = getattr(module, src, None)
             if value is None:
-                missing.append(f"{module_path}.{name}")
-            resolved[name] = value
+                missing.append(f"{module_path}.{src}")
+            resolved[dst] = value
 
     if missing:
         raise MissingHermesApi("missing symbols: " + ", ".join(missing))
@@ -273,7 +315,7 @@ def load() -> types.SimpleNamespace:
         except Exception:
             # 모듈 자체가 없는 구버전 Hermes. 이 기능만 끄고 계속한다.
             module = None
-        for name in names:
-            resolved[name] = getattr(module, name, None) if module is not None else None
+        for src, dst in _pairs(names):
+            resolved[dst] = getattr(module, src, None) if module is not None else None
 
     return types.SimpleNamespace(**resolved)

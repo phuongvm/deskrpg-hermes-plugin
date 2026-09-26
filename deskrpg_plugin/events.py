@@ -50,7 +50,11 @@ _SOURCE_RANK = {"k": 0, "d": 1, "c": 2, "a": 3}
 # E3 — Hermes task_events.kind → 계약 kind
 # ---------------------------------------------------------------------------
 
-RUN_FINISHED_KINDS = frozenset({"completed", "reclaimed", "gave_up", "timed_out", "crashed", "stale"})
+# `spawn_failed` (the worker never started) and `rate_limited` (quota wall, requeued without counting a
+# failure) also close a run — without them the run's end never reached the stream and the NPC stayed "working".
+RUN_FINISHED_KINDS = frozenset({
+    "completed", "reclaimed", "gave_up", "timed_out", "crashed", "stale", "spawn_failed", "rate_limited",
+})
 STATUS_KINDS = frozenset({
     "status", "promoted", "promoted_manual", "blocked", "unblocked", "review_requested",
     "changes_requested", "review_reopened", "archived", "scheduled", "specified",
@@ -271,7 +275,12 @@ def map_kanban_row(api, conn, slug, row) -> list:
     if kind in ("linked", "unlinked"):
         return [_base_event(slug, row, "task.link", {**payload, "action": kind})]
     if kind == "spawned":
-        return [_base_event(slug, row, "task.run.started", payload)]
+        # Hermes' `spawned` carries only pid/started_at. The card's assignee (the profile the worker runs as) is
+        # what tells a client whose work started — without it DeskRPG could not mark the employee as working
+        # until its next restart resync. Omitted if the card is already gone.
+        _status, _title, assignee, _parents = _task_snapshot(api, conn, row["task_id"])
+        started = {**payload, "assignee": assignee} if assignee else payload
+        return [_base_event(slug, row, "task.run.started", started)]
     if kind in STATUS_KINDS:
         return [_base_event(slug, row, "task.status", _status_payload(api, conn, row, kind, payload))]
     if kind in UPDATED_KINDS:
@@ -657,6 +666,7 @@ SQL_ARTIFACT_MAX_ID = "SELECT COALESCE(MAX(id), 0) FROM artifact_events"
 ARTIFACT_EVENT_KINDS = ("artifact.created", "artifact.versioned", "artifact.deleted",
                         "artifact.capture_failed", "artifact.delete_partial")
 CARD_PROPOSAL_EVENT_KINDS = ("card_proposal.created",)
+APPROVAL_EVENT_KINDS = ("approval.blocked",)
 
 
 def _artifact_conn(api):
@@ -878,29 +888,39 @@ def wants_card_proposals(raw) -> bool:
     return "card_proposals" in _include_tokens(raw)
 
 
-def artifact_kind_filter(*, include_artifacts: bool, include_card_proposals: bool) -> tuple:
-    """`a` 출처에서 읽을 종류. 둘 다 끄면 빈 튜플 — 호출자는 출처를 아예 읽지 않는다."""
+def wants_approvals(raw) -> bool:
+    """`include=approvals` 옵트인(0.18.0) — 무인 실행 막힘 사건. 다른 토큰과 독립이다."""
+    return "approvals" in _include_tokens(raw)
+
+
+def artifact_kind_filter(*, include_artifacts: bool, include_card_proposals: bool,
+                         include_approvals: bool = False) -> tuple:
+    """`a` 출처에서 읽을 종류. 모두 끄면 빈 튜플 — 호출자는 출처를 아예 읽지 않는다."""
     kinds = []
     if include_artifacts:
         kinds.extend(ARTIFACT_EVENT_KINDS)
     if include_card_proposals:
         kinds.extend(CARD_PROPOSAL_EVENT_KINDS)
+    if include_approvals:
+        kinds.extend(APPROVAL_EVENT_KINDS)
     return tuple(kinds)
 
 
-def now_state(api, conn, slug, *, include_artifacts=False, include_card_proposals=False) -> dict:
+def now_state(api, conn, slug, *, include_artifacts=False, include_card_proposals=False,
+              include_approvals=False) -> dict:
     """E1 — 커서가 없을 때의 "지금" 위치. `a` 는 옵트인했을 때만 싣는다(어느 종류든)."""
     state = {
         "k": max_event_id(conn),
         "d": deleted_log_position(api, slug),
         "c": cron_now_positions(api),
     }
-    if include_artifacts or include_card_proposals:
+    if include_artifacts or include_card_proposals or include_approvals:
         state["a"] = artifact_position(api, {})
     return state
 
 
-def collect(api, slug, state, limit, *, include_artifacts=False, include_card_proposals=False) -> dict:
+def collect(api, slug, state, limit, *, include_artifacts=False, include_card_proposals=False,
+            include_approvals=False) -> dict:
     """E3–E6 을 한 번에: 세 출처를 읽고 병합해 `{events, cursor, has_more}` 를 만든다. 워커 스레드 안에서 부른다."""
     tz = _timezone_of(api)
     with board_conn(api, slug) as conn:
@@ -914,7 +934,8 @@ def collect(api, slug, state, limit, *, include_artifacts=False, include_card_pr
     cron_events, cron_info = cron_tail(api, state.get("c") or {}, tz)
     # 옵트인하지 않은 호출자는 아티팩트 출처를 읽지도 합치지도 않고, 받은 `a` 를 그대로 돌려준다(없으면 없는 채로).
     kinds = artifact_kind_filter(include_artifacts=include_artifacts,
-                                 include_card_proposals=include_card_proposals)
+                                 include_card_proposals=include_card_proposals,
+                                 include_approvals=include_approvals)
     if kinds:
         old_a = artifact_position(api, state)
         artifact_events = read_artifact_events(api, old_a, limit + 1, kinds)
@@ -943,8 +964,8 @@ def collect(api, slug, state, limit, *, include_artifacts=False, include_card_pr
 def events_handler(api):
     """GET /deskrpg/events?board=&cursor=&limit=&include= → `{events, cursor, has_more}` (E1–E7).
 
-    아티팩트 사건은 `include=artifacts`, 카드 제안 사건은 `include=card_proposals` 일 때만 섞인다(R17)
-    — 구버전 DeskRPG 는 모르는 kind 를 받지 않는다. 둘은 서로 독립이다.
+    아티팩트 사건은 `include=artifacts`, 카드 제안 사건은 `include=card_proposals`, 무인 실행 막힘은
+    `include=approvals` 일 때만 섞인다(R17) — 구버전 DeskRPG 는 모르는 kind 를 받지 않는다. 셋은 서로 독립이다.
     """
 
     @guarded
@@ -954,6 +975,7 @@ def events_handler(api):
         token = request.query.get("cursor")
         include_artifacts = wants_artifacts(request.query.get("include"))
         include_card_proposals = wants_card_proposals(request.query.get("include"))
+        include_approvals = wants_approvals(request.query.get("include"))
 
         def work():
             if not api.board_exists(slug):
@@ -961,11 +983,13 @@ def events_handler(api):
             if token is None or token == "":
                 with board_conn(api, slug) as conn:
                     state = now_state(api, conn, slug, include_artifacts=include_artifacts,
-                                      include_card_proposals=include_card_proposals)
+                                      include_card_proposals=include_card_proposals,
+                                      include_approvals=include_approvals)
                 return {"events": [], "cursor": encode_cursor(state), "has_more": False}
             state = decode_cursor(token)
             result = collect(api, slug, state, limit, include_artifacts=include_artifacts,
-                             include_card_proposals=include_card_proposals)
+                             include_card_proposals=include_card_proposals,
+                             include_approvals=include_approvals)
             log_event("events.tail", board=slug, count=len(result["events"]), has_more=result["has_more"])
             return result
 

@@ -14,6 +14,7 @@ EXPECTED_ROUTES = {
     ("GET", "/deskrpg/profiles", _OWNER),
     ("POST", "/deskrpg/profiles", _OWNER),
     ("DELETE", "/deskrpg/profiles/{name}", _OWNER),
+    ("POST", "/deskrpg/profiles/{name}/key", _OWNER),
     ("POST", "/deskrpg/worker-plugin", _OWNER),
     ("GET", "/p/{profile}/deskrpg/identity", _PROFILE),
     ("PUT", "/p/{profile}/deskrpg/identity", _PROFILE),
@@ -87,6 +88,7 @@ EXPECTED_ROUTES = {
     ("DELETE", "/deskrpg/kanban/attachments/{id}", _OWNER),
     ("GET", "/deskrpg/kanban/links", _OWNER),
     ("GET", "/deskrpg/kanban/runs", _OWNER),
+    ("GET", "/deskrpg/kanban/events", _OWNER),
     ("POST", "/deskrpg/kanban/links", _OWNER),
     ("DELETE", "/deskrpg/kanban/links", _OWNER),
     ("POST", "/deskrpg/kanban/dispatch", _OWNER),
@@ -127,12 +129,44 @@ EXPECTED_ROUTES = {
     ("POST", "/deskrpg/card-proposals/{proposal_id}/unresolve", _OWNER),
     # 만들어진 카드 id 를 사후에 적는다 — 그 순간부터 unresolve 가 막힌다(카드 중복 이중 방어).
     ("POST", "/deskrpg/card-proposals/{proposal_id}/task", _OWNER),
+    ("POST", "/p/{profile}/deskrpg/ask-user/sessions", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/questions", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/questions/{question_id}/answer", _PROFILE),
+    # 0.17.0 NPC MCP 커넥터 관리 (프로필 키)
+    ("GET", "/p/{profile}/deskrpg/mcp/jobs/{job_id}", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/oauth/{session_id}/callback", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/oauth/{session_id}", _PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/mcp/oauth/{session_id}", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/catalog", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/catalog/{entry}/install", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/reload", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/export/{name}", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/servers", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/servers", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/servers/{name}", _PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}", _PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/mcp/servers/{name}", _PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/enabled", _PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/trust", _PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/tools", _PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/secrets/{key}", _PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/mcp/servers/{name}/secrets/{key}", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/servers/{name}/test", _PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/servers/{name}/tools", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/servers/{name}/oauth", _PROFILE),
+    # 0.18.0 무인 실행 승인 정책 (프로필 키)
+    ("GET", "/p/{profile}/deskrpg/approval-policy", _PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/approval-policy", _PROFILE),
+    ("POST", "/p/{profile}/deskrpg/approval-policy/allowlist", _PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/approval-policy/allowlist", _PROFILE),
+    # What a session read (profile key)
+    ("GET", "/p/{profile}/deskrpg/sessions/{session_id}/sources", _PROFILE),
 }
 
 
 def test_라우트_테이블이_스펙의_예순여덟_개와_스코프까지_정확히_같다():
-    assert len(EXPECTED_ROUTES) == 94
-    assert len(routes.ROUTES) == 94, "행 수가 다르다 — 중복 행이거나 빠진 행이다"
+    assert len(EXPECTED_ROUTES) == 125
+    assert len(routes.ROUTES) == 125, "행 수가 다르다 — 중복 행이거나 빠진 행이다"
     assert {(m, p, s) for m, p, _h, s in routes.ROUTES} == EXPECTED_ROUTES
 
 
@@ -140,11 +174,12 @@ def test_소유자_라우트는_41_개_프로필_라우트는_27_개다():
     by_scope = {}
     for _m, _p, _h, scope in routes.ROUTES:
         by_scope[scope] = by_scope.get(scope, 0) + 1
-    # 소유자: 기존 4 + 워커 플러그인 1 + 칸반 21 + 보드 첨부 목록 1 + 뷰 묶음 조회 2 + 스웜 2 + 사건 1 + 아티팩트 6 + 카드 제안 3 = 41 ·
+    # 소유자: 기존 4 + 기존 프로필 키 발급 1 + 워커 플러그인 1 + 칸반 21 + 보드 첨부 목록 1 + 뷰 묶음 조회 2 + 상태 전이 묶음 조회 1 + 스웜 2 + 사건 1 + 아티팩트 6 + 카드 제안 3 = 43 ·
     # 프로필: 기존 5 + 크론 12 + 0.9.0 피커 2 + 프로바이더 키 2 + OAuth 4 + 0.10.0 도구 프로바이더 2
-    #   + 0.15.0 스킬 CRUD 11 + 스킬 Hub 6 + curator·관계도 8 = 52.
-    assert by_scope == {routes.Scope.DEFAULT: 4 + 1 + 21 + 1 + 2 + 2 + 2 + 6 + 3,
-                        routes.Scope.PROFILE: 5 + 12 + 2 + 2 + 4 + 2 + 11 + 6 + 8}
+    #   + 0.15.0 스킬 CRUD 11 + 스킬 Hub 6 + curator·관계도 8 + 0.17.0 MCP 21 + 0.18.0 승인 정책 4 + session sources 1
+    #   + 대화 중 묻기 3 = 81.
+    assert by_scope == {routes.Scope.DEFAULT: 4 + 1 + 1 + 21 + 1 + 2 + 1 + 2 + 2 + 6 + 3,
+                        routes.Scope.PROFILE: 5 + 12 + 2 + 2 + 4 + 2 + 11 + 6 + 8 + 21 + 4 + 1 + 3}
 
 
 def test_OAuth_취소_행이_연결_끊기_행보다_앞에_있다():
@@ -217,7 +252,7 @@ def test_plugin_yaml_이_requires_hermes_를_최상위에_선언하고_버전은
 
     raw = (pathlib.Path(__file__).resolve().parent.parent / "plugin.yaml").read_text(encoding="utf-8")
     manifest = yaml.safe_load(raw)
-    assert manifest["version"] == "0.16.0"
+    assert manifest["version"] == "0.26.0"
     assert manifest["requires_hermes"] == ">=0.21.1"
     assert "requires" not in manifest
 
@@ -285,3 +320,20 @@ def test_hub_curator_관계도_라우트는_profile_skill_admin_과_같은_심�
     paths = [p for _m, p, _h, _s in routes.routes_for(fake_api)]
     assert not [p for p in paths if any(n in p for n in names)]
     assert "profile_skill_admin" not in capabilities(fake_api)
+
+
+def test_MCP_고정_세그먼트는_서버_이름_와일드카드보다_먼저다():
+    paths = [p for _m, p, _h, _s in routes.ROUTES]
+    first_wild = min(i for i, p in enumerate(paths) if p.startswith("/p/{profile}/deskrpg/mcp/servers/{name}"))
+    for p in ("/p/{profile}/deskrpg/mcp/jobs/{job_id}", "/p/{profile}/deskrpg/mcp/catalog",
+              "/p/{profile}/deskrpg/mcp/reload", "/p/{profile}/deskrpg/mcp/servers"):
+        assert paths.index(p) < first_wild, f"{p} 가 서버 이름 와일드카드 뒤에 있다"
+
+
+def test_MCP_라우트는_profile_mcp_admin_과_같은_심볼_집합을_본다(fake_api):
+    from deskrpg_plugin.contract_fields import capabilities
+
+    assert sum(p.startswith("/p/{profile}/deskrpg/mcp/") for _m, p, _h, _s in routes.routes_for(fake_api)) == 21
+    fake_api._connect_server = None
+    assert not [p for _m, p, _h, _s in routes.routes_for(fake_api) if "/deskrpg/mcp/" in p]
+    assert "profile_mcp_admin" not in capabilities(fake_api)

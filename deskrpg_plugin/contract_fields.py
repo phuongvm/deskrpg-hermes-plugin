@@ -29,9 +29,23 @@ PLUGIN_INFO_KANBAN_KEYS = frozenset({"dispatcher_present", "attachments", "attac
 # `worker_plugin` = `/deskrpg/info` 의 `worker_plugin` 보고와 `POST /deskrpg/worker-plugin`. 프로필 목록·경로 심볼만
 # 쓰므로 늘 된다.
 # `kanban_attachment_list` = `GET /deskrpg/kanban/attachments?board=` (보드 전체 첨부, 결과물 갤러리용).
+# `ask_user` = 도구 `deskrpg_ask_user` 와 `/p/{profile}/deskrpg/ask-user/sessions`·`/questions`·`/questions/{id}/answer`.
+# DeskRPG 는 이 값이 있을 때만 1:1 run 세션을 등록하고 질문 카드를 띄운다.
+# `board_archive` = `PATCH /deskrpg/kanban/boards/{slug}` 의 `archived` 키와 목록의 `?include_archived=`.
+# 옛 플러그인은 그 키에 `unknown_field` 400 을 내므로 호출부는 이 값으로 판정한다.
+# `kanban_task_events` = `GET /deskrpg/kanban/events?board=&from=&to=&kind=status` (status transitions in a window,
+# for the rework metric). Reads only the board DB, so it is always available when kanban is.
+# `kanban_run_events` = card detail `events[].run_id`, and `spawn_failed`·`rate_limited` closing a run in the
+# event stream (`task.run.finished`).
+# `profile_key_issue` = `POST /deskrpg/profiles/{name}/key` (a key for a profile made outside DeskRPG). Uses only
+# profile paths and the `.env` writer, so it is always available.
+# `session_sources` = `GET /p/{profile}/deskrpg/sessions/{id}/sources` (web pages and files a session read). Reads
+# only the profile's state.db through `SessionDB`, a required symbol, so it is always available.
 CAPABILITIES = (
     "kanban", "cron", "events", "event_cursor_handoff", "artifacts", "kanban_views", "card_proposals", "worker_plugin",
-    "kanban_attachment_list",
+    "kanban_attachment_list", "board_archive", "kanban_task_events", "kanban_run_events", "profile_key_issue",
+    "session_sources",
+    "ask_user",
 )
 
 
@@ -63,6 +77,29 @@ _SKILL_ADMIN_SYMBOLS = (
     "quarantine_bundle", "scan_skill", "should_allow_install",
     "_profile_action_environment", "_dashboard_spawn_executable",
 )
+
+
+# 0.17.0 — NPC MCP 커넥터 관리. `_hermes_api.OPTIONAL_SPEC` 의 0.17.0 블록과 같은 집합이다.
+_MCP_ADMIN_SYMBOLS = (
+    "_get_mcp_servers", "_save_mcp_server", "_remove_mcp_server", "_env_key_for_server",
+    "_bearer_auth_headers", "_oauth_tokens_present", "redact_mcp_probe_text", "_resolve_mcp_server_config",
+    "validate_mcp_server_entry", "_ensure_mcp_loop", "_run_on_mcp_loop", "_connect_server",
+    "discover_mcp_tools", "_stop_mcp_loop_if_idle", "shutdown_mcp_servers", "reprobe_tool_availability",
+    "mcp_registry", "_profile_runtime_scope", "mcp_list_catalog", "mcp_get_catalog_entry",
+    "mcp_card_install_config", "mcp_oauth_start", "mcp_oauth_cancel_attempt",
+    "deliver_callback_flow", "poll_flow", "cancel_flow",
+)
+
+
+def has_approval_policy_symbols(api) -> bool:
+    """무인 실행 정책(0.18.0). 프로필 config.yaml 을 직접 읽고 쓰므로 Hermes 심볼이 필요 없다 — 항상 참.
+    라우트와 capability 가 이 한 판정을 함께 쓰게 해 둔다(나중에 심볼이 필요해지면 여기만 바꾼다)."""
+    return True
+
+
+def has_mcp_admin_symbols(api) -> bool:
+    """MCP 관리 라우트와 `profile_mcp_admin` capability 가 **같은 판정**을 쓴다 — 라우트 없는 capability 를 알리지 않으려고."""
+    return _has(api, _MCP_ADMIN_SYMBOLS)
 
 
 def has_skill_admin_symbols(api) -> bool:
@@ -109,6 +146,36 @@ def has_review_policy(api) -> bool:
         return "review_policy" in inspect.signature(api.create_task).parameters
     except (TypeError, ValueError, AttributeError):
         return False
+
+
+# Keyword parameters the plugin passes to Hermes swarm internals. If Hermes renames or drops one, the capability
+# goes away instead of the call failing halfway (fail-closed: DeskRPG keeps blocking new swarms).
+_SWARM_UNCOMMITTED_PARAMS = frozenset({
+    "goal", "workers", "verifier_assignee", "synthesizer_assignee", "root_title", "verifier_title",
+    "synthesizer_title", "tenant", "created_by", "workspace_kind", "workspace_path", "priority", "idempotency_key",
+})
+_ACTIVATE_ROOT_PARAMS = frozenset({"summary", "metadata"})
+
+
+def has_swarm_policy_symbols(api) -> bool:
+    """`swarm_review_policy` capability and the policy-aware swarm path share this check.
+
+    Needs the approval-policy contract itself, the swarm internals the plugin assembles with, and their expected
+    signatures — a Hermes build that moved them must not get a half-protected swarm."""
+    import inspect
+
+    if not has_review_policy(api) or getattr(api, "create_swarm", None) is None:
+        return False
+    names = ("_create_swarm_uncommitted", "_activate_root_inline", "create_policy", "inherited_policy",
+             "latest_run", "_fire_kanban_lifecycle_hook")
+    if not all(callable(getattr(api, n, None)) for n in names):
+        return False
+    try:
+        uncommitted = set(inspect.signature(api._create_swarm_uncommitted).parameters)
+        activate = set(inspect.signature(api._activate_root_inline).parameters)
+    except (TypeError, ValueError):
+        return False
+    return _SWARM_UNCOMMITTED_PARAMS <= uncommitted and _ACTIVATE_ROOT_PARAMS <= activate
 
 
 def has_initial_status(api) -> bool:
@@ -160,12 +227,19 @@ def capabilities(api) -> tuple[str, ...]:
         extra.append("kanban_review_policy_v1")
     if getattr(api, "create_swarm", None) is not None:
         extra.append("swarm")
+    if has_swarm_policy_symbols(api):
+        # New swarms on approval-policy boards: every result card gets its policy in the creating transaction.
+        extra.append("swarm_review_policy")
     if has_toolset_symbols(api):
         extra.append("profile_toolsets")
     if has_skill_symbols(api):
         extra.append("profile_skills")
     if has_skill_admin_symbols(api):
         extra.append("profile_skill_admin")
+    if has_mcp_admin_symbols(api):
+        extra.append("profile_mcp_admin")
+    if has_approval_policy_symbols(api):
+        extra.append("profile_approval_policy")
     if _has(api, ("PROVIDER_REGISTRY",)):
         extra.append("profile_clone")
         extra.append("profile_provider_keys")
@@ -201,7 +275,7 @@ KANBAN_TASK_ACTIONS = (
 BOARD_META_REQUIRED = frozenset({"slug"})
 BOARD_META_OPTIONAL = frozenset({
     "name", "description", "is_current", "total", "default_workdir",
-    "default_workspace_kind", "project_id", "project_name",
+    "default_workspace_kind", "project_id", "project_name", "archived",
 })
 BOARD_META_KEYS = BOARD_META_REQUIRED | BOARD_META_OPTIONAL
 
@@ -221,6 +295,9 @@ KANBAN_TASK_OPTIONAL = frozenset({
     "body", "assignee", "priority", "tenant", "created_at", "latest_summary",
     "comment_count", "link_counts", "progress", "warnings", "started_at",
     "worker_pid", "last_heartbeat_at", "review",
+    # Since 0.21.0 (`kanban_run_events`): lets the board tell a card blocked after repeated failures from one
+    # blocked for another reason, without a detail call per card.
+    "consecutive_failures",
 })
 KANBAN_TASK_KEYS = KANBAN_TASK_REQUIRED | KANBAN_TASK_OPTIONAL
 
@@ -228,7 +305,7 @@ KANBAN_TASK_KEYS = KANBAN_TASK_REQUIRED | KANBAN_TASK_OPTIONAL
 KANBAN_TASK_FULL_EXTRA_OPTIONAL = frozenset({
     "result", "created_by", "model_override", "provider_override", "reasoning_effort",
     "completed_at", "last_failure_error", "workspace_kind", "workspace_path",
-    "branch_name", "consecutive_failures", "diagnostics",
+    "branch_name", "diagnostics",
 })
 KANBAN_TASK_FULL_REQUIRED = KANBAN_TASK_REQUIRED
 KANBAN_TASK_FULL_OPTIONAL = KANBAN_TASK_OPTIONAL | KANBAN_TASK_FULL_EXTRA_OPTIONAL
@@ -246,12 +323,21 @@ KANBAN_TIMELINE_RUN_REQUIRED = KANBAN_RUN_REQUIRED | frozenset({"task_id", "boar
 KANBAN_TIMELINE_RUN_OPTIONAL = KANBAN_RUN_OPTIONAL | frozenset({"task_title", "tenant", "step_key"})
 KANBAN_TIMELINE_RUN_KEYS = KANBAN_TIMELINE_RUN_REQUIRED | KANBAN_TIMELINE_RUN_OPTIONAL
 
+# Status transitions for the rework metric (`GET /kanban/events?kind=status`). `from` is null when no earlier
+# status is known; `tenant` is null for a card that has since been deleted.
+KANBAN_STATUS_TRANSITION_REQUIRED = frozenset({"id", "task_id", "board", "from", "to", "created_at"})
+KANBAN_STATUS_TRANSITION_OPTIONAL = frozenset({"tenant"})
+KANBAN_STATUS_TRANSITION_KEYS = KANBAN_STATUS_TRANSITION_REQUIRED | KANBAN_STATUS_TRANSITION_OPTIONAL
+
 KANBAN_COMMENT_REQUIRED = frozenset({"id", "author", "body", "created_at"})
 KANBAN_COMMENT_KEYS = KANBAN_COMMENT_REQUIRED
 
 # 카드별 이력(KanbanEvent) — 통합 사건 스트림(PluginEvent)과는 다른 모양이다.
 KANBAN_EVENT_REQUIRED = frozenset({"id", "kind", "payload", "created_at"})
-KANBAN_EVENT_KEYS = KANBAN_EVENT_REQUIRED
+# `run_id` ties an event to the run it came from (null for card-level events). DeskRPG groups a card's history
+# by attempt with it; announced as capability `kanban_run_events`.
+KANBAN_EVENT_OPTIONAL = frozenset({"run_id"})
+KANBAN_EVENT_KEYS = KANBAN_EVENT_REQUIRED | KANBAN_EVENT_OPTIONAL
 
 KANBAN_ATTACHMENT_REQUIRED = frozenset({"id", "filename"})
 KANBAN_ATTACHMENT_OPTIONAL = frozenset({"size"})
@@ -295,7 +381,9 @@ UPDATE_TASK_KEYS = (CREATE_TASK_KEYS - {"idempotency_key"}) | frozenset({"status
 CREATE_BOARD_REQUIRED = frozenset({"slug", "name"})
 CREATE_BOARD_OPTIONAL = frozenset({"default_workdir"})
 CREATE_BOARD_KEYS = CREATE_BOARD_REQUIRED | CREATE_BOARD_OPTIONAL
-UPDATE_BOARD_KEYS = frozenset({"name", "description", "default_workdir"})
+# `archived` = Hermes `board.json` 의 보관 플래그(`write_board_metadata(archived=)`). 폴더를 옮기는
+# `remove_board` 와 달리 되돌릴 수 있다. 보관된 보드는 게이트웨이 디스패처·알림 감시자가 건너뛴다.
+UPDATE_BOARD_KEYS = frozenset({"name", "description", "default_workdir", "archived"})
 
 ORCHESTRATION_SETTINGS_REQUIRED = frozenset({
     "orchestrator_profile", "default_assignee", "auto_decompose",
@@ -330,6 +418,8 @@ EVENT_KINDS = frozenset({
     "artifact.delete_partial",
     # 카드 제안 — `include=card_proposals` 로 옵트인했을 때만 실린다. 아티팩트 옵트인과 독립이다.
     "card_proposal.created",
+    # 무인 실행 막힘 — `include=approvals` 로 옵트인했을 때만 실린다(0.18.0).
+    "approval.blocked",
 })
 
 PLUGIN_EVENT_REQUIRED = frozenset({"id", "ts", "kind", "payload"})
@@ -429,3 +519,10 @@ ARTIFACT_SUMMARY_KEYS = ARTIFACT_SUMMARY_REQUIRED | ARTIFACT_SUMMARY_OPTIONAL
 ARTIFACT_VERSION_REQUIRED = frozenset({"version", "filename", "mime", "size", "sha256", "created_by", "captured_via", "created_at"})
 ARTIFACT_VERSION_OPTIONAL = frozenset({"origin_path", "note", "pruned_at"})
 ARTIFACT_VERSION_KEYS = ARTIFACT_VERSION_REQUIRED | ARTIFACT_VERSION_OPTIONAL
+
+# ---------------------------------------------------------------------------
+# Session sources (`session_sources`) — what a session read
+# ---------------------------------------------------------------------------
+SESSION_SOURCE_KINDS = ("web", "file")
+SESSION_SOURCES_KEYS = frozenset({"session_id", "sources", "outside_workdir_files", "truncated"})
+SESSION_SOURCE_KEYS = frozenset({"kind", "ref", "title", "via", "at"})

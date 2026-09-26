@@ -1,13 +1,19 @@
 name: deskrpg
-version: 0.16.0
+version: 0.26.0
 description: "DeskRPG backend — adds DeskRPG routes to the Hermes API Server: profile list/create/delete, SOUL.md read/write, kanban, cron and event streams, NPC skill management, an artifact store and the artifact_save tool. Install it through the DeskRPG setup wizard."
 author: Dante Labs
 kind: standalone
 requires_hermes: ">=0.21.1"
+# Third-party packages the plugin imports that Hermes core does not guarantee. Upstream Hermes dropped PyYAML
+# from its core dependencies; without this the plugin fails to import there. `aiohttp` is not listed: the plugin
+# runs inside the API server, which already requires it.
+python_dependencies:
+  - "PyYAML>=6,<7"
 
 provides_tools:
   - artifact_save
   - propose_kanban_card
+  - deskrpg_ask_user
 provides_hooks:
   - post_tool_call
   - post_llm_call

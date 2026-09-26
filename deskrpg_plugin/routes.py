@@ -31,8 +31,15 @@ from . import cron as _cron
 from . import events as _events
 from . import artifacts_routes as _artifacts_routes
 from . import card_proposal_routes as _card_proposal_routes
+from . import ask_user as _ask_user
 from . import skills_hub_routes as _skills_hub
 from . import learning_routes as _learning
+from . import mcp_admin as _mcp_admin
+from . import mcp_probe as _mcp_probe
+from . import mcp_oauth_routes as _mcp_oauth
+from . import mcp_catalog_routes as _mcp_catalog
+from . import approval_policy as _approval_policy
+from . import session_sources as _session_sources
 from .artifacts_tool import artifact_upload_max_bytes as _artifact_upload_max_bytes
 
 
@@ -63,12 +70,17 @@ logger = logging.getLogger("deskrpg_plugin")
 
 PLUGIN_VERSION = _read_plugin_version()
 
+# attach 에 넘어온 API Server 어댑터. MCP 재적재가 캐시된 에이전트를 새로고침하려고 그 `gateway_runner` 를 본다.
+ADAPTER = None
+
 # (method, path, handler_name, scope)
 ROUTES = [
     ("GET", "/deskrpg/info", "info", Scope.DEFAULT),
     ("GET", "/deskrpg/profiles", "list_profiles", Scope.DEFAULT),
     ("POST", "/deskrpg/profiles", "create_profile", Scope.DEFAULT),
     ("DELETE", "/deskrpg/profiles/{name}", "delete_profile", Scope.DEFAULT),
+    # Key for a profile made outside DeskRPG (owner key only; never reads an existing key back).
+    ("POST", "/deskrpg/profiles/{name}/key", "issue_profile_key", Scope.DEFAULT),
     # 워커(칸반·크론)는 프로필 홈으로 뜬다 — 그 홈에도 이 플러그인이 있게 한다. 명시 호출 전용(worker_plugin 모듈 주석).
     ("POST", "/deskrpg/worker-plugin", "ensure_worker_plugin", Scope.DEFAULT),
     ("GET", "/p/{profile}/deskrpg/identity", "get_identity", Scope.PROFILE),
@@ -105,6 +117,35 @@ ROUTES = [
     ("PUT", "/p/{profile}/deskrpg/skills/{name}/enabled", "skill_enabled", Scope.PROFILE),
     ("PUT", "/p/{profile}/deskrpg/skills/{name}/pinned", "skill_pinned", Scope.PROFILE),
     ("POST", "/p/{profile}/deskrpg/skills/{name}/archive", "skill_archive", Scope.PROFILE),
+    # ---- 0.17.0 NPC MCP 커넥터 관리 (프로필 키) — 고정 세그먼트 행이 servers 행보다 위 ----
+    ("GET", "/p/{profile}/deskrpg/mcp/jobs/{job_id}", "mcp_job", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/oauth/{session_id}/callback", "mcp_oauth_callback", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/oauth/{session_id}", "mcp_oauth_poll", Scope.PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/mcp/oauth/{session_id}", "mcp_oauth_cancel", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/catalog", "mcp_catalog", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/catalog/{entry}/install", "mcp_catalog_install", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/reload", "mcp_reload", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/export/{name}", "mcp_export", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/servers", "mcp_list", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/servers", "mcp_create", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/servers/{name}", "mcp_detail", Scope.PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}", "mcp_update", Scope.PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/mcp/servers/{name}", "mcp_delete", Scope.PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/enabled", "mcp_enabled", Scope.PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/trust", "mcp_trust", Scope.PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/tools", "mcp_tools_put", Scope.PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/mcp/servers/{name}/secrets/{key}", "mcp_secret_put", Scope.PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/mcp/servers/{name}/secrets/{key}", "mcp_secret_delete", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/servers/{name}/test", "mcp_test", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/mcp/servers/{name}/tools", "mcp_tools_get", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/mcp/servers/{name}/oauth", "mcp_oauth_start", Scope.PROFILE),
+    # ---- 0.18.0 무인 실행 정책 (프로필 키) — 허용 목록 항목은 `/`·공백이 있어 본문으로 받는다 ----
+    ("GET", "/p/{profile}/deskrpg/approval-policy", "approval_policy_get", Scope.PROFILE),
+    ("PUT", "/p/{profile}/deskrpg/approval-policy", "approval_policy_put", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/approval-policy/allowlist", "approval_allowlist_add", Scope.PROFILE),
+    ("DELETE", "/p/{profile}/deskrpg/approval-policy/allowlist", "approval_allowlist_delete", Scope.PROFILE),
+    # What a session read (web pages, files) — derived from the profile's state.db, nothing stored.
+    ("GET", "/p/{profile}/deskrpg/sessions/{session_id}/sources", "session_sources", Scope.PROFILE),
     ("GET", "/p/{profile}/deskrpg/toolsets/{toolset}/providers", "get_tool_providers", Scope.PROFILE),
     ("PUT", "/p/{profile}/deskrpg/toolsets/{toolset}/provider", "put_tool_provider", Scope.PROFILE),
     ("PUT", "/p/{profile}/deskrpg/provider-keys/{provider}", "put_provider_key", Scope.PROFILE),
@@ -143,6 +184,7 @@ ROUTES = [
     # 같은 경로의 GET 은 POST/DELETE 와 충돌하지 않는다. 읽기를 위에 모아 둔다).
     ("GET", "/deskrpg/kanban/links", "kanban_list_links", Scope.DEFAULT),
     ("GET", "/deskrpg/kanban/runs", "kanban_list_runs", Scope.DEFAULT),
+    ("GET", "/deskrpg/kanban/events", "kanban_list_task_events", Scope.DEFAULT),
     ("POST", "/deskrpg/kanban/links", "kanban_add_link", Scope.DEFAULT),
     ("DELETE", "/deskrpg/kanban/links", "kanban_remove_link", Scope.DEFAULT),
     ("POST", "/deskrpg/kanban/dispatch", "kanban_dispatch", Scope.DEFAULT),
@@ -179,6 +221,10 @@ ROUTES = [
     ("POST", "/deskrpg/card-proposals/{proposal_id}/resolve", "card_proposal_resolve", Scope.DEFAULT),
     ("POST", "/deskrpg/card-proposals/{proposal_id}/unresolve", "card_proposal_unresolve", Scope.DEFAULT),
     ("POST", "/deskrpg/card-proposals/{proposal_id}/task", "card_proposal_record_task", Scope.DEFAULT),
+    # ---- 대화 중 묻기 (프로필 키 — 그 프로필의 질문만 보고 답한다) ---------------------------
+    ("POST", "/p/{profile}/deskrpg/ask-user/sessions", "ask_user_register", Scope.PROFILE),
+    ("GET", "/p/{profile}/deskrpg/questions", "ask_user_list", Scope.PROFILE),
+    ("POST", "/p/{profile}/deskrpg/questions/{question_id}/answer", "ask_user_answer", Scope.PROFILE),
 ]
 
 # Hermes 의 프로필 프리픽스 미들웨어는 `request.match_info.get("profile")` 로
@@ -212,6 +258,7 @@ _HANDLERS = {
     "info": lambda api: _make_info(api),
     "ensure_worker_plugin": lambda api: _worker_plugin.ensure_handler(api),
     "list_profiles": lambda api: _profiles.list_handler(api),
+    "issue_profile_key": lambda api: _profiles.key_handler(api),
     "create_profile": lambda api: _profiles.create_handler(api),
     "delete_profile": lambda api: _profiles.delete_handler(api),
     "get_identity": lambda api: _identity.get_handler(api),
@@ -232,6 +279,32 @@ _HANDLERS = {
     "skill_purge": lambda api: _skills_admin.purge_handler(api),
     "skill_pinned": lambda api: _skills_admin.pinned_handler(api),
     "skill_archive": lambda api: _skills_admin.archive_handler(api),
+    "mcp_list": lambda api: _mcp_admin.list_handler(api),
+    "mcp_create": lambda api: _mcp_admin.create_handler(api),
+    "mcp_detail": lambda api: _mcp_admin.detail_handler(api),
+    "mcp_update": lambda api: _mcp_admin.update_handler(api),
+    "mcp_delete": lambda api: _mcp_admin.delete_handler(api),
+    "mcp_enabled": lambda api: _mcp_admin.enabled_handler(api),
+    "mcp_trust": lambda api: _mcp_admin.trust_handler(api),
+    "mcp_tools_put": lambda api: _mcp_admin.tools_put_handler(api),
+    "mcp_secret_put": lambda api: _mcp_admin.secret_put_handler(api),
+    "mcp_secret_delete": lambda api: _mcp_admin.secret_delete_handler(api),
+    "mcp_job": lambda api: _mcp_probe.job_handler(api),
+    "mcp_test": lambda api: _mcp_probe.test_handler(api),
+    "mcp_tools_get": lambda api: _mcp_probe.tools_get_handler(api),
+    "mcp_oauth_start": lambda api: _mcp_oauth.start_handler(api),
+    "mcp_oauth_callback": lambda api: _mcp_oauth.callback_handler(api),
+    "mcp_oauth_poll": lambda api: _mcp_oauth.poll_handler(api),
+    "mcp_oauth_cancel": lambda api: _mcp_oauth.cancel_handler(api),
+    "mcp_catalog": lambda api: _mcp_catalog.catalog_handler(api),
+    "mcp_catalog_install": lambda api: _mcp_catalog.install_handler(api),
+    "mcp_reload": lambda api: _mcp_catalog.reload_handler(api),
+    "mcp_export": lambda api: _mcp_catalog.export_handler(api),
+    "approval_policy_get": lambda api: _approval_policy.get_handler(api),
+    "session_sources": lambda api: _session_sources.get_handler(api),
+    "approval_policy_put": lambda api: _approval_policy.put_handler(api),
+    "approval_allowlist_add": lambda api: _approval_policy.allowlist_add_handler(api),
+    "approval_allowlist_delete": lambda api: _approval_policy.allowlist_delete_handler(api),
     "get_tool_providers": lambda api: _tool_providers.providers_handler(api),
     "put_tool_provider": lambda api: _tool_providers.select_handler(api),
     "put_provider_key": lambda api: _provider_keys.put_handler(api),
@@ -259,6 +332,7 @@ _HANDLERS = {
     "kanban_delete_attachment": lambda api: _kanban_files.delete_attachment_handler(api),
     "kanban_list_links": lambda api: _kanban_views.links_handler(api),
     "kanban_list_runs": lambda api: _kanban_views.runs_handler(api),
+    "kanban_list_task_events": lambda api: _kanban_views.task_events_handler(api),
     "kanban_add_link": lambda api: _kanban_board.link_handler(api, "add"),
     "kanban_remove_link": lambda api: _kanban_board.link_handler(api, "remove"),
     "kanban_dispatch": lambda api: _kanban_ops.dispatch_handler(api),
@@ -292,6 +366,9 @@ _HANDLERS = {
     "artifacts_delete": lambda api: _artifacts_routes.delete_handler(api),
     # 카드 제안
     "card_proposal_resolve": lambda api: _card_proposal_routes.resolve_handler(api),
+    "ask_user_register": lambda api: _ask_user.register_handler(api),
+    "ask_user_list": lambda api: _ask_user.list_handler(api),
+    "ask_user_answer": lambda api: _ask_user.answer_handler(api),
     "card_proposal_unresolve": lambda api: _card_proposal_routes.unresolve_handler(api),
     "card_proposal_record_task": lambda api: _card_proposal_routes.record_task_handler(api),
     # 스킬 Hub (0.15.0)
@@ -401,8 +478,11 @@ def _info_dispatcher_present(api) -> bool:
     Hermes 의 `_check_dispatcher_presence` 자체도 fail-open 이다 — 경고를 놓치는 쪽이
     멀쩡한 게이트웨이에 "디스패처 없음" 을 외치는 쪽보다 낫다.
     """
+    probe = getattr(api, "_check_dispatcher_presence", None)
+    if probe is None:  # optional Hermes internal — without it, assume present (fail-open)
+        return True
     try:
-        present, _message = api._check_dispatcher_presence(api.get_hermes_home())
+        present, _message = probe(api.get_hermes_home())
         return bool(present)
     except Exception:
         return True
@@ -527,6 +607,33 @@ _OPTIONAL_ROUTES = {
     "learning_node_get": _contract_fields.has_skill_admin_symbols,
     "learning_node_put": _contract_fields.has_skill_admin_symbols,
     "learning_node_delete": _contract_fields.has_skill_admin_symbols,
+    # 0.17.0 — MCP 관리 라우트 전부가 `profile_mcp_admin` capability 와 같은 판정을 쓴다.
+    "mcp_list": _contract_fields.has_mcp_admin_symbols,
+    "mcp_create": _contract_fields.has_mcp_admin_symbols,
+    "mcp_detail": _contract_fields.has_mcp_admin_symbols,
+    "mcp_update": _contract_fields.has_mcp_admin_symbols,
+    "mcp_delete": _contract_fields.has_mcp_admin_symbols,
+    "mcp_enabled": _contract_fields.has_mcp_admin_symbols,
+    "mcp_trust": _contract_fields.has_mcp_admin_symbols,
+    "mcp_tools_put": _contract_fields.has_mcp_admin_symbols,
+    "mcp_secret_put": _contract_fields.has_mcp_admin_symbols,
+    "mcp_secret_delete": _contract_fields.has_mcp_admin_symbols,
+    "mcp_job": _contract_fields.has_mcp_admin_symbols,
+    "mcp_test": _contract_fields.has_mcp_admin_symbols,
+    "mcp_tools_get": _contract_fields.has_mcp_admin_symbols,
+    "mcp_oauth_start": _contract_fields.has_mcp_admin_symbols,
+    "mcp_oauth_callback": _contract_fields.has_mcp_admin_symbols,
+    "mcp_oauth_poll": _contract_fields.has_mcp_admin_symbols,
+    "mcp_oauth_cancel": _contract_fields.has_mcp_admin_symbols,
+    "mcp_catalog": _contract_fields.has_mcp_admin_symbols,
+    "mcp_catalog_install": _contract_fields.has_mcp_admin_symbols,
+    "mcp_reload": _contract_fields.has_mcp_admin_symbols,
+    "mcp_export": _contract_fields.has_mcp_admin_symbols,
+    # 0.18.0 — `profile_approval_policy` capability 와 같은 판정.
+    "approval_policy_get": _contract_fields.has_approval_policy_symbols,
+    "approval_policy_put": _contract_fields.has_approval_policy_symbols,
+    "approval_allowlist_add": _contract_fields.has_approval_policy_symbols,
+    "approval_allowlist_delete": _contract_fields.has_approval_policy_symbols,
 }
 
 
@@ -550,6 +657,8 @@ def attach(app, adapter, api) -> None:
     app.router.add_* 를 여기 말고 어디서도 부르지 않는다 — 그래야 감싸지 않은
     핸들러가 생길 수 없다.
     """
+    global ADAPTER
+    ADAPTER = adapter
     before = len(getattr(app.router, "_resources", []))
     for method, path, handler_name, scope in routes_for(api):
         handler = require_auth(adapter, scope, handler_for(handler_name, api))

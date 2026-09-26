@@ -72,7 +72,7 @@ def test_spawned_는_task_run_started_에_run_id_를_싣고_claimed_는_무시�
     evs = _tail(fake_api, conn, since=created_id)
     assert [e["kind"] for e in evs] == ["task.run.started"]
     assert evs[0]["run_id"] == 7
-    assert evs[0]["payload"] == {"pid": 123}
+    assert evs[0]["payload"]["pid"] == 123
 
 
 @pytest.mark.parametrize(
@@ -210,7 +210,9 @@ def test_completed_는_run_finished_와_status_변화_한_건을_같이_낸다(f
     assert evs[1]["payload"]["to"] == "done"
 
 
-@pytest.mark.parametrize("kind", ["reclaimed", "gave_up", "timed_out", "crashed", "stale"])
+@pytest.mark.parametrize(
+    "kind", ["reclaimed", "gave_up", "timed_out", "crashed", "stale", "spawn_failed", "rate_limited"],
+)
 def test_상태가_그대로면_run_finished_만_낸다(fake_api, kanban, conn, kind):
     task = kanban.make_task(conn, title="카드")
     kanban.emit("default", task.id, "status", {"status": "ready"})
@@ -312,3 +314,33 @@ def test_deleted_tail_은_깨진_줄을_건너뛰고_n_없는_줄은_줄_번호�
 
 def test_삭제_기록_경로는_board_dir_아래_deskrpg_deleted_jsonl_이다(fake_api, kanban):
     assert events.deleted_log_path(fake_api, "default") == kanban.board_dir("default") / "deskrpg_deleted.jsonl"
+
+
+@pytest.mark.parametrize("kind", ["spawn_failed", "rate_limited"])
+def test_spawn_failed_and_rate_limited_close_the_run_with_its_run_id(fake_api, kanban, conn, kind):
+    # Both end a run in Hermes. Dropping them left the NPC "working" and the run's end invisible.
+    task = kanban.make_task(conn, title="card")
+    kanban.emit("default", task.id, "status", {"status": "ready"})
+    kanban.set_status("default", task.id, "ready")
+    kanban.emit("default", task.id, kind, {"error": "boom", "failures": 1, "retry_status": "ready"}, run_id=12)
+    evs = _only(kanban, conn, fake_api)
+    assert [e["kind"] for e in evs] == ["task.run.finished"]
+    assert evs[0]["run_id"] == 12
+    assert evs[0]["payload"]["outcome"] == kind
+    assert evs[0]["payload"]["error"] == "boom"
+
+
+def test_run_started_names_the_card_assignee_so_a_client_knows_whose_work_started(fake_api, kanban, conn):
+    task = kanban.make_task(conn, title="card", assignee="sophie")
+    created_id = kanban.boards["default"].events[-1].id
+    kanban.emit("default", task.id, "spawned", {"pid": 9, "started_at": 100}, run_id=3)
+    evs = _tail(fake_api, conn, since=created_id)
+    assert evs[0]["payload"] == {"pid": 9, "started_at": 100, "assignee": "sophie"}
+
+
+def test_run_started_without_an_assignee_adds_nothing(fake_api, kanban, conn):
+    task = kanban.make_task(conn, title="card")
+    created_id = kanban.boards["default"].events[-1].id
+    kanban.emit("default", task.id, "spawned", {"pid": 9}, run_id=3)
+    evs = _tail(fake_api, conn, since=created_id)
+    assert evs[0]["payload"] == {"pid": 9}
