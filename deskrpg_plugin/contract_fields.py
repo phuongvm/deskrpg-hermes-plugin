@@ -8,6 +8,9 @@ TS 타입을 파이썬 쪽에 그대로 베낀 것이다 — 핸들러가 응답
 `*_KEYS` 는 둘의 합집합이다. 계약 파일을 고치면 여기도 같이 고친다.
 """
 
+import hashlib
+import time
+
 # ---------------------------------------------------------------------------
 # 공통 — /deskrpg/info
 # ---------------------------------------------------------------------------
@@ -17,8 +20,12 @@ PLUGIN_INFO_REQUIRED = frozenset({
 })
 # `routes` 는 0.1.0 부터 내던 필드라 유지한다. 계약 타입에는 없지만 해가 없다.
 # `worker_plugin` 은 0.11.2 에서 더했다 — 옛 플러그인에는 없으므로 계약상 선택 키다.
-PLUGIN_INFO_KEYS = PLUGIN_INFO_REQUIRED | frozenset({"routes", "worker_plugin"})
-PLUGIN_INFO_KANBAN_KEYS = frozenset({"dispatcher_present", "attachments", "attachment_max_bytes"})
+PLUGIN_INFO_KEYS = PLUGIN_INFO_REQUIRED | frozenset(
+    {"routes", "worker_plugin", "capabilities_fingerprint", "started_at", "install"}
+)
+PLUGIN_INFO_KANBAN_KEYS = frozenset(
+    {"dispatcher_present", "attachments", "attachment_max_bytes", "review_hooks", "worker_launch"}
+)
 # 항상 있는 것. 스웜처럼 Hermes 빌드에 따라 갈리는 것은 `capabilities()` 가 붙인다.
 # `kanban_views` = 묶음 조회(`GET /kanban/links`, `GET /kanban/runs`). Hermes 의 선택 심볼을
 # 쓰지 않고 보드 DB 만 읽으므로 칸반이 되면 늘 된다 — 그래도 **capability 로 내보낸다.**
@@ -61,21 +68,33 @@ _OAUTH_SYMBOLS = (
     "_oauth_sessions", "_oauth_sessions_lock", "_oauth_profile_name", "clear_provider_auth",
 )
 
-# 0.15.0 — NPC 스킬 관리(spec §3.1). `_hermes_api.OPTIONAL_SPEC` 의 0.15.0 블록과 같은 집합이다.
-_SKILL_ADMIN_SYMBOLS = (
-    "_find_all_skills", "_sort_skills",
-    "load_usage", "activity_count", "latest_activity_at", "is_curator_managed",
-    "is_hub_installed", "is_bundled", "set_pinned", "archive_skill", "restore_skill",
-    "list_archived_skill_names", "_archive_dir", "_find_skill_dir", "_find_external_skill_dir",
-    "capture_before", "append_entry", "set_ledger_actor", "reset_ledger_actor",
-    "_create_skill", "_edit_skill", "_write_file", "_find_skill",
-    "is_external_skill_path", "clear_skills_system_prompt_cache",
-    "load_state", "is_enabled", "is_paused", "set_paused", "get_interval_hours",
-    "get_min_idle_hours", "get_stale_after_days", "get_archive_after_days",
-    "build_learning_graph", "node_detail", "edit_node", "delete_node", "parse_node_kind",
-    "create_source_router", "parallel_search_sources", "_resolve_source_meta_and_bundle",
-    "quarantine_bundle", "scan_skill", "should_allow_install",
-    "_profile_action_environment", "_dashboard_spawn_executable",
+# NPC skill management, split by feature so a Hermes build that moves one symbol turns off only that feature.
+# `_hermes_api.OPTIONAL_SPEC` loads all of them. Hub jobs and curator runs use the documented Hermes CLI
+# (skill_jobs), so they need no symbol of their own.
+_SKILL_CORE_SYMBOLS = (
+    "_find_all_skills", "_sort_skills", "load_usage", "activity_count", "latest_activity_at", "is_curator_managed",
+    "is_hub_installed", "is_bundled", "is_external_skill_path", "_find_skill_dir", "_find_external_skill_dir",
+    "set_ledger_actor", "reset_ledger_actor", "clear_skills_system_prompt_cache",
+)
+_SKILL_READ_SYMBOLS = _SKILL_CORE_SYMBOLS + ("list_archived_skill_names", "_archive_dir")
+_SKILL_EDIT_SYMBOLS = _SKILL_CORE_SYMBOLS + (
+    "_create_skill", "_edit_skill", "_find_skill", "set_pinned", "archive_skill", "restore_skill",
+)
+_SKILL_HUB_SYMBOLS = _SKILL_CORE_SYMBOLS + (
+    "create_source_router", "parallel_search_sources", "_resolve_source_meta_and_bundle", "quarantine_bundle",
+    "scan_skill", "should_allow_install",
+)
+_CURATOR_SYMBOLS = (
+    "load_state", "is_enabled", "is_paused", "set_paused", "get_interval_hours", "get_min_idle_hours",
+    "get_stale_after_days", "get_archive_after_days",
+)
+_LEARNING_GRAPH_SYMBOLS = _SKILL_CORE_SYMBOLS + (
+    "build_learning_graph", "node_detail", "edit_node", "delete_node", "parse_node_kind", "archive_skill",
+    "_edit_skill",
+)
+# Capability name → the check the capability and its routes share.
+SKILL_CAPABILITIES = (
+    "profile_skill_read", "profile_skill_edit", "profile_skill_hub", "profile_curator", "profile_learning_graph",
 )
 
 
@@ -102,9 +121,43 @@ def has_mcp_admin_symbols(api) -> bool:
     return _has(api, _MCP_ADMIN_SYMBOLS)
 
 
+def has_skill_read(api) -> bool:
+    """`profile_skill_read`: skill detail, file reading, the archive list."""
+    return _has(api, _SKILL_READ_SYMBOLS)
+
+
+def has_skill_edit(api) -> bool:
+    """`profile_skill_edit`: create, replace SKILL.md, enable/disable, pin, archive, restore."""
+    return _has(api, _SKILL_EDIT_SYMBOLS)
+
+
+def has_skill_hub(api) -> bool:
+    """`profile_skill_hub`: hub search and preview in-process; install/uninstall/update via the Hermes CLI."""
+    return _has(api, _SKILL_HUB_SYMBOLS)
+
+
+def has_curator(api) -> bool:
+    """`profile_curator`: curator status and pause in-process; runs via the Hermes CLI."""
+    return _has(api, _CURATOR_SYMBOLS)
+
+
+def has_learning_graph(api) -> bool:
+    """`profile_learning_graph`: the learning graph and its nodes."""
+    return _has(api, _LEARNING_GRAPH_SYMBOLS)
+
+
+SKILL_CHECKS = {
+    "profile_skill_read": has_skill_read,
+    "profile_skill_edit": has_skill_edit,
+    "profile_skill_hub": has_skill_hub,
+    "profile_curator": has_curator,
+    "profile_learning_graph": has_learning_graph,
+}
+
+
 def has_skill_admin_symbols(api) -> bool:
-    """`profile_skill_admin` capability 와 스킬 관리 라우트 전부가 같은 판정을 쓴다."""
-    return _has(api, _SKILL_ADMIN_SYMBOLS) and has_skill_symbols(api)
+    """`profile_skill_admin`, kept for DeskRPG builds that know only this one name: every skill feature is on."""
+    return all(check(api) for check in SKILL_CHECKS.values()) and has_skill_symbols(api)
 
 
 def _has(api, names) -> bool:
@@ -178,6 +231,31 @@ def has_swarm_policy_symbols(api) -> bool:
     return _SWARM_UNCOMMITTED_PARAMS <= uncommitted and _ACTIVATE_ROOT_PARAMS <= activate
 
 
+_REVIEW_HOOK_SYMBOLS = (
+    "kanban_home", "connect_closing", "get_task", "list_events", "request_review", "assign_task",
+    "reopen_review_task", "complete_task",
+)
+
+
+def has_review_hooks(api) -> bool:
+    """`review_hooks_v1`: per-card approval enforced by this plugin's worker hooks on any Hermes (no core patch).
+
+    Needs the public kanban verbs the hooks and the approval routes use, both hooks registered in this process,
+    and the approval store open-able."""
+    from . import review_hooks
+    from .review_store import open_store, sidecar_path
+
+    if not review_hooks.HOOKS_REGISTERED:
+        return False
+    if not all(callable(getattr(api, name, None)) for name in _REVIEW_HOOK_SYMBOLS):
+        return False
+    try:
+        open_store(sidecar_path(api)).close()
+    except Exception:  # noqa: BLE001 — an unwritable store means the hooks would block every completion
+        return False
+    return True
+
+
 def has_initial_status(api) -> bool:
     """이 Hermes 빌드의 `create_task` 가 `initial_status` 를 받는가.
 
@@ -236,6 +314,7 @@ def capabilities(api) -> tuple[str, ...]:
         extra.append("profile_skills")
     if has_skill_admin_symbols(api):
         extra.append("profile_skill_admin")
+    extra.extend(name for name, check in SKILL_CHECKS.items() if check(api))
     if has_mcp_admin_symbols(api):
         extra.append("profile_mcp_admin")
     if has_approval_policy_symbols(api):
@@ -247,11 +326,36 @@ def capabilities(api) -> tuple[str, ...]:
         extra.append("profile_oauth")
     if has_tool_provider_symbols(api):
         extra.append("profile_tool_providers")
+    if has_review_hooks(api):
+        from .review_contract import REVIEW_HOOKS_CAPABILITY
+
+        extra.append(REVIEW_HOOKS_CAPABILITY)
     if has_initial_status(api):
         # 실행 전 승인 관문이 카드를 `blocked` 로 세울 수 있는가. 화면은 이 값이 없으면
         # "플러그인 업데이트 필요" 로 안내한다 — 조용히 승인 없이 실행되지 않게.
         extra.append("initial_status")
     return CAPABILITIES + tuple(extra)
+
+
+# When this gateway process loaded the plugin (epoch seconds). A restart can change what /deskrpg/info
+# reports (worker launch, hook coverage) even when the capability list stays the same.
+STARTED_AT = int(time.time())
+
+
+def capabilities_fingerprint(caps) -> str:
+    """Order-independent short hash of a capability list.
+
+    Swapping the Hermes core can add or drop capabilities without changing the plugin version, so a
+    client caching /deskrpg/info by version alone keeps a stale verdict. Comparing this value on a
+    call it already makes lets it notice the change without an extra request.
+    """
+    joined = "\n".join(sorted(set(caps)))
+    return hashlib.sha256(joined.encode()).hexdigest()[:16]
+
+
+def freshness(api) -> dict:
+    """The markers /deskrpg/info and /deskrpg/events both carry so a client can spot a changed gateway."""
+    return {"capabilities_fingerprint": capabilities_fingerprint(capabilities(api)), "started_at": STARTED_AT}
 
 # ---------------------------------------------------------------------------
 # A.1 칸반 — 상태·열
@@ -426,7 +530,7 @@ PLUGIN_EVENT_REQUIRED = frozenset({"id", "ts", "kind", "payload"})
 PLUGIN_EVENT_OPTIONAL = frozenset({"board", "task_id", "profile", "job_id", "run_id", "artifact_id"})
 PLUGIN_EVENT_KEYS = PLUGIN_EVENT_REQUIRED | PLUGIN_EVENT_OPTIONAL
 
-EVENTS_PAGE_KEYS = frozenset({"events", "cursor", "has_more"})
+EVENTS_PAGE_KEYS = frozenset({"events", "cursor", "has_more", "capabilities_fingerprint", "started_at"})
 EVENT_HANDOFF_KEYS = frozenset({"cursor"})
 
 TASK_STATUS_PAYLOAD_KEYS = frozenset({"from", "to", "parent_count", "title", "assignee"})

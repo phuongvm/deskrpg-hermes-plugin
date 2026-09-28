@@ -159,9 +159,10 @@ SPEC = (
 # 이 없는 구버전 Hermes 에서 칸반·크론까지 전부 죽는다.
 OPTIONAL_SPEC = (
     # Hermes internals with no public replacement. Upstream can move them at any time, so the plugin must still
-    # load without them: a missing probe drops only the "dispatcher missing" warning, and a missing terminator
-    # only refuses reopening a finished card whose descendants are running (kanban_board._write_status).
-    ("hermes_cli.kanban", ("_check_dispatcher_presence",)),
+    # load without them: a missing terminator only refuses reopening a finished card whose descendants are running
+    # (kanban_board._write_status). `_check_dispatcher_presence` is not used — from inside the gateway it asks the
+    # gateway's own control socket and stalls (POSIX) or deadlocks (Windows) its event loop; see
+    # routes._info_dispatcher_present.
     ("hermes_cli.kanban_db_dispatch", ("_terminate_reclaimed_worker",)),
     ("hermes_cli.kanban_review_policy", ("API_VERSION", "get_review_state", "approve_task",
         "update_review_policy", "guard_task_mutation", "patch_review_task")),
@@ -227,8 +228,8 @@ OPTIONAL_SPEC = (
             "_skills_dir", "_read_skill_name", "is_excluded_skill_path",
         ),
     ),
-    ("tools.skill_ledger", ("capture_before", "append_entry", "set_ledger_actor", "reset_ledger_actor")),
-    ("tools.skill_manager_tool", ("_create_skill", "_edit_skill", "_write_file", "_find_skill")),
+    ("tools.skill_ledger", ("set_ledger_actor", "reset_ledger_actor")),
+    ("tools.skill_manager_tool", ("_create_skill", "_edit_skill", "_find_skill")),
     ("agent.prompt_builder", ("clear_skills_system_prompt_cache",)),
     (
         "agent.curator",
@@ -241,7 +242,6 @@ OPTIONAL_SPEC = (
     ("hermes_cli.skills_hub", ("_resolve_source_meta_and_bundle",)),
     ("tools.skills_hub_install", ("quarantine_bundle",)),
     ("tools.skills_guard", ("scan_skill", "should_allow_install")),
-    ("hermes_cli.web_server_gateway", ("_profile_action_environment", "_dashboard_spawn_executable")),
     # 0.17.0 — NPC MCP 커넥터 관리. 전부 있을 때만 profile_mcp_admin 을 알린다(contract_fields).
     # 모듈 간 흔한 이름(start·registry·list_catalog …)은 `(원래 이름, 평면 이름)` 쌍으로 별칭을 준다.
     ("hermes_cli.mcp_config", (

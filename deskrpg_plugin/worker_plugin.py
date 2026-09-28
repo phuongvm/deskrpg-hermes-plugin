@@ -163,6 +163,18 @@ def report(api) -> dict:
     return {"missing": missing, "propagation": "enabled" if propagation_enabled(api) else "disabled"}
 
 
+def review_hooks_report(api) -> dict:
+    """Which profiles would run kanban work without the approval hooks — `/deskrpg/info` `kanban.review_hooks`.
+
+    The hooks act inside each worker's own profile home, so a profile where this plugin is not linked and enabled
+    would complete policy cards unchecked. DeskRPG uses the list to refuse assigning a policy card to them."""
+    missing = report(api)["missing"]
+    return {
+        "propagation": propagation_enabled(api),
+        "profiles_without_plugin": sorted(st["profile"] for st in missing),
+    }
+
+
 def _ensure_link(link: Path) -> str:
     state = _link_state(link)
     if state == "linked":
@@ -252,12 +264,12 @@ def ensure_handler(api):
                 not isinstance(names, list) or not all(isinstance(n, str) and n for n in names)
             ):
                 raise web.HTTPBadRequest(reason="profiles must be a list of profile names")
-        if names is None:
-            names = [getattr(p, "name", str(p)) for p in api.list_profiles()]
-
         def run():
+            # Hermes' list_profiles asks the gateway's control pipe whether each profile's gateway runs — only a
+            # worker thread may do that; on the gateway's own loop the pipe can never answer.
+            targets = names if names is not None else [getattr(p, "name", str(p)) for p in api.list_profiles()]
             results = []
-            for name in names:
+            for name in targets:
                 try:
                     results.append(ensure(api, name))
                 except EnsureFailed as exc:

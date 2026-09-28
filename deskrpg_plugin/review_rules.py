@@ -1,0 +1,113 @@
+"""Pure approval decisions for the review hooks. No I/O: review_hooks gathers the situation and applies the result."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from .review_contract import (
+    BLOCK_RETURN_MESSAGE, BLOCK_SUBMIT_MESSAGE, BLOCK_TERMINAL_MESSAGE, BLOCK_UNAVAILABLE_MESSAGE, BLOCK_VERDICT_MESSAGE,
+)
+from .review_store import Policy
+
+TERMINAL_TOOLS = ("terminal", "shell", "bash")
+_COMPLETE_RE = re.compile(r"\bhermes\b.*\bkanban\s+(complete|done)\b|\bhermes\b.*\bkanban\b.*--status[= ]done\b")
+
+
+@dataclass(frozen=True)
+class Situation:
+    policy: Policy | None
+    caller: str
+    reviewer_run: bool
+    waiting_human: bool
+    store_ok: bool
+
+
+def resolve_policy(card, board_default, task_id, assignee):
+    if card is not None:
+        return card
+    if board_default is None:
+        return None
+    mode, reviewer = board_default
+    return Policy(task_id, mode, assignee, reviewer, "board_default")
+
+
+def is_terminal_completion(command: str) -> bool:
+    return bool(_COMPLETE_RE.search(command or ""))
+
+
+def _block(message):
+    return {"action": "block", "message": message}
+
+
+def decide_pre(tool, args, s):
+    if tool == "kanban_complete":
+        if not s.store_ok:
+            return _block(BLOCK_UNAVAILABLE_MESSAGE)
+        p = s.policy
+        if p is None:
+            return None
+        if s.waiting_human:
+            return _block(BLOCK_RETURN_MESSAGE)
+        if s.reviewer_run and p.mode == "agent":
+            return None
+        if s.reviewer_run and p.mode == "mixed":
+            return _block(BLOCK_VERDICT_MESSAGE)
+        return _block(BLOCK_SUBMIT_MESSAGE)
+    if tool == "kanban_request_changes" and s.policy is not None and s.waiting_human:
+        # A run that slipped onto a card waiting for a person must not send it back on its own.
+        return _block(BLOCK_RETURN_MESSAGE)
+    if tool == "kanban_request_review" and s.policy is not None:
+        # Hermes shallow-merges a modify directive into the original arguments, so a reviewer the model chose is
+        # cleared by setting it to None — leaving the key out would keep the model's choice.
+        rest = {k: v for k, v in args.items() if k != "reviewer"}
+        if _goes_to_a_person(s):
+            return {"action": "modify", "args": {**rest, "reviewer": None}}
+        return {"action": "modify", "args": {**rest, "reviewer": s.policy.reviewer_profile}}
+    if tool in TERMINAL_TOOLS and is_terminal_completion(str(args.get("command", ""))):
+        # Completing from the shell is the same completion: refused when the policy cannot be read, too.
+        if not s.store_ok:
+            return _block(BLOCK_UNAVAILABLE_MESSAGE)
+        if s.policy is not None:
+            return _block(BLOCK_TERMINAL_MESSAGE)
+    return None
+
+
+def should_release_to_human(tool, result, s):
+    if tool != "kanban_request_review" or s.policy is None:
+        return False
+    if not (isinstance(result, dict) and result.get("ok") and result.get("status") == "review"):
+        return False
+    return _goes_to_a_person(s)
+
+
+def _goes_to_a_person(s) -> bool:
+    """Whether a submission from this run waits for a person instead of an AI reviewer.
+
+    Besides human cards and a mixed reviewer's verdict: a run on a card already waiting for a person (including a
+    reviewer that would review its own work), and an implementation run by the policy's own reviewer profile —
+    handing it to that reviewer would let one profile implement and approve the same card."""
+    p = s.policy
+    if p.mode == "human" or s.waiting_human:
+        return True
+    if p.mode == "mixed" and s.reviewer_run:
+        return True
+    return not s.reviewer_run and bool(p.reviewer_profile) and s.caller == p.reviewer_profile
+
+
+def agent_decision(tool, args, result, s):
+    """The AI reviewer's own decision to record, as `(verdict, summary)`, or None.
+
+    On an agent card the reviewer's completion is the approval; on agent and mixed cards its request for changes
+    is a rejection. A mixed reviewer's `kanban_request_review` is an opinion for the person who decides, not a
+    decision, so it is not recorded. Only successful calls count."""
+    if s.policy is None or not s.reviewer_run:
+        return None
+    if not (isinstance(result, dict) and result.get("ok")):
+        return None
+    args = args if isinstance(args, dict) else {}
+    if tool == "kanban_complete" and s.policy.mode == "agent":
+        return "approve", args.get("summary") or args.get("result")
+    if tool == "kanban_request_changes" and s.policy.mode in ("agent", "mixed"):
+        return "reject", args.get("reason")
+    return None

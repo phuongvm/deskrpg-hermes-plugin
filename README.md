@@ -17,7 +17,7 @@ Connect [DeskRPG](https://github.com/dandacompany/deskrpg), a self-hosted virtua
 Python 3.11+ and Hermes Agent >=0.21.1 with the API Server enabled. Runtime dependencies are aiohttp and PyYAML, provided by Hermes. Internal Hermes API availability is checked during registration.
 
 ```sh
-plugin_sha=$(git ls-remote https://github.com/dandacompany/deskrpg-hermes-plugin.git refs/tags/v0.26.0 | cut -f1)
+plugin_sha=$(git ls-remote https://github.com/dandacompany/deskrpg-hermes-plugin.git refs/tags/v0.30.2 | cut -f1)
 hermes plugins install https://github.com/dandacompany/deskrpg-hermes-plugin --ref "$plugin_sha"
 hermes plugins enable deskrpg
 hermes plugins doctor deskrpg
@@ -63,7 +63,8 @@ Routes under `/p/{profile}/deskrpg/skills`, `/curator` and `/learning` act on th
 - **Subprocesses.** Skills Hub install, uninstall and update, and curator runs, start `hermes -p <profile> skills install|uninstall|update …` or `hermes -p <profile> curator run` as a background job (one per profile) using Hermes' own executable and its profile-action environment, so the gateway profile's credentials are not passed to the child. Only the last 4 KB of output is kept, with secret-like values masked.
 - **Scan override.** Hub preview returns Hermes' security-scan verdict as `allow`, `ask` or `block`. A caller holding the profile's key can install an `ask` skill by sending `force: true`, which passes `--force` to `hermes skills install` — the same override Hermes' own CLI offers. `block` is refused whatever `force` says, and `force` is ignored for `allow`.
 - **Network.** Hub search and preview go to the skill sources configured in Hermes, through Hermes' own source router. The plugin makes no network requests of its own.
-- **File writes.** Editing and creating skills writes `SKILL.md`, `references/` and `templates/` through Hermes' skill write functions (other paths, symlinks and non-local skills are refused). Enable/disable writes `skills.disabled` in the profile's `config.yaml` with a backup. Pin, archive, restore and purge use Hermes' lifecycle functions; purge is recorded in the Hermes skill ledger.
+- **File writes.** Creating a skill and replacing its `SKILL.md` go through Hermes' skill write functions (non-local skills are refused). Reference files are read-only: writing one answers 410 `skill_reference_edit_removed` — ask the employee in chat to change it. Enable/disable writes `skills.disabled` in the profile's `config.yaml` with a backup. Pin, archive and restore use Hermes' lifecycle functions. Permanently deleting a single archived skill answers 410 `skill_purge_removed`; use the Hermes dashboard or `hermes -p <profile> curator purge`.
+- **Skill jobs.** Hub install/uninstall/update and curator runs execute the documented CLI (`hermes -p <profile> skills|curator …`) in a child process: `DESKRPG_HERMES_BIN` or `HERMES_BIN` if set, else `hermes` on PATH, else the gateway's own interpreter with `-m hermes_cli.main`. The child gets the gateway environment without the gateway `.env` keys and anything named like a key, token, secret, password, cookie or credential, with `HERMES_HOME` set to the profile. Jobs stop after 15 minutes.
 - **Memory.** Learning-graph memory nodes are returned only on request (`includeMemory=1`) and are edited or deleted only when a content hash matches. Hermes has no undo for memory deletion, so each deleted chunk is appended to `<profile home>/plugin-data/deskrpg/memory_deleted.jsonl` (`0600`) first.
 
 ### Other settings
@@ -80,17 +81,110 @@ Stop the gateway and back up its kanban databases before replacing core code. In
 
 New cards default to human approval. An explicitly delegated task can be approved by a different AI profile. Approvals bind to the submitted result; generic status changes cannot substitute for approval. AI reviewers must inspect the actual submitted text or artifacts; this does not guarantee the semantic quality of an AI review. Existing cards are not converted automatically.
 
+### Moving an install off the patched core
+
+The plugin can enforce approvals on upstream Hermes with its own hooks and approval store. The order below is what
+moving a source install (a checkout with a Python 3.11 virtualenv and a systemd user unit) actually took.
+
+**1. Back up the Hermes home** with the gateway stopped, including the core checkout, its virtualenv and the unit
+file, so the whole step can be undone.
+
+**2. Carry the policies over, with the gateway stopped.** The patched core recreates its triggers
+(`CREATE TRIGGER IF NOT EXISTS`) whenever a board database is opened, so a running gateway would put them back:
+
+```bash
+systemctl --user stop hermes-gateway
+# in the old Hermes environment, once per DeskRPG board
+python -m deskrpg_plugin.review_migrate --board <board-slug> --dry-run --drop-patch-triggers   # report only
+python -m deskrpg_plugin.review_migrate --board <board-slug> --drop-patch-triggers
+```
+
+It copies each card's policy and recorded approvals into the approval store and leaves a card that was waiting for
+a person in `review` with nobody assigned. Cards it cannot move are listed under `skipped`. The patch's tables are
+only read and are kept as a record. `--drop-patch-triggers` removes the eleven triggers the patch installed in the
+board database (listed under `dropped_triggers`; nothing else is touched). They outlive the patched core: without
+this, a card the patch had not approved could never be completed on upstream Hermes, not even through an approval in
+DeskRPG.
+
+**3. Install upstream Hermes with its own installer.** Current upstream runs only on Python 3.14: every runtime
+dependency in `pyproject.toml` carries a `python_version >= '3.14'` marker, so `pip install -e .` into an older
+virtualenv installs no dependencies (upstream `website/docs/getting-started/updating.md`, "Python 3.14 and older
+interpreters"). From the checkout, at the commit you pin, run the upstream package manager — tools first, then the
+environment with the extras you use named explicitly:
+
+```bash
+cd <hermes checkout> && git checkout --detach <commit>
+./venv/bin/python -m pm.cli install --tools-only
+./venv/bin/python -m pm.cli install --extra messaging --extra mcp   # plus the extras the old venv had
+```
+
+`pm.cli install` given only `--extra` does not install the tool closure (ffmpeg, node, ripgrep…) and stops with
+"tools not on PATH before venv sync" (`pm/cli.py`, `cmd_install`); `--tools-only` first avoids that. The API
+server needs `aiohttp`, which comes with the `messaging` extra. PM publishes a Python 3.14 under `<HERMES_HOME>/tools`,
+the environment under `<HERMES_HOME>/installs`, and repoints `~/.local/bin/hermes` to the launcher
+`<checkout>/.hermes/bin/hermes`. (`hermes update` does the same but moves to the latest `main`; use it when you do not
+pin a commit.)
+
+**4. Give the checkout an install stamp.** Without `install-stamp.json` Hermes reports a placeholder version
+(`0.19.1`), and this plugin (`requires_hermes: ">=0.21.1"`) is skipped at load — every `/deskrpg/*` route disappears.
+Write one with the upstream script; Hermes rewrites it from git on the next start:
+
+```bash
+<hermes python> scripts/write_install_stamp.py --output install-stamp.json \
+    --base-version <nearest release> --distance <commits since it> --update-mechanism self
+```
+
+**5. Regenerate the service unit** with upstream's own template (`hermes_cli.gateway.generate_systemd_unit()`, the same
+text `hermes gateway install` writes): its `ExecStart`, `ExecStop` and `ExecStopPost` run the launcher, and the old
+virtualenv leaves `PATH` and `VIRTUAL_ENV`.
+
+**6. Point kanban workers at the launcher.** Under the PM runtime the gateway imports Hermes through a `PYTHONPATH`
+that Hermes strips from child environments (`tools/environments/local.py`), and the dispatcher's default worker
+command is `python -m hermes_cli.main` unless `$HERMES_BIN` is set (`hermes_cli/kanban_db_dispatch.py`,
+`_resolve_hermes_argv`). Without it every worker exits with `No module named 'hermes_cli'` and the card is given up.
+Set it for the gateway service, for example in a drop-in:
+
+```ini
+# ~/.config/systemd/user/hermes-gateway.service.d/hermes-bin.conf
+[Service]
+Environment="HERMES_BIN=<checkout>/.hermes/bin/hermes"
+```
+
+Then `systemctl --user daemon-reload`, start the gateway, and check `/deskrpg/info`: `review_hooks_v1` present,
+`kanban_review_policy_v1` absent.
+
+Known gap: the DeskRPG setup wizard does not set `HERMES_BIN` for a gateway on the PM runtime yet; set it by hand as
+above.
+
 ## Upstream Hermes main
 
 CI also runs the integration suite on upstream Hermes `main` (job `integration-upstream`, non-blocking; locally
 `scripts/ci-local.sh --upstream`). Tests that need the approval-policy core patch are excluded there. Known
-upstream breaks, excluded from that job with the `upstream_known_break` marker:
+upstream breaks are excluded from that job with the `upstream_known_break` marker; there are none at the moment.
 
-- **NPC skill management** (`profile_skill_admin`): Hermes main removed
-  `hermes_cli.web_server_gateway._dashboard_spawn_executable`, which skill jobs use to start `hermes` commands.
-  On such a build the capability is not announced and the skill routes are not registered.
+Skill management is announced per feature (`profile_skill_read`, `profile_skill_edit`, `profile_skill_hub`,
+`profile_curator`, `profile_learning_graph`), so a Hermes build that moves one symbol turns off only that feature.
+`profile_skill_admin` is still announced when all five are on.
 
 ## Release
+
+0.30.2 moves the profile listing in `POST /deskrpg/worker-plugin` into a worker thread. Hermes checks each profile's gateway through the gateway's own control socket while listing profiles, which deadlocked the loop on Windows. A test now fails if any route coroutine calls those Hermes functions directly.
+
+0.30.1 keeps the gateway's event loop free while it answers `/deskrpg/info` and the profile routes. The blocking checks now run in worker threads; the slow ones (`kanban.worker_launch`, the per-profile worker plugin and review-hook checks) are waited on for at most two seconds, then report null ("not known yet") and fill a 30-second cache for the next call. `kanban.dispatcher_present` now follows `kanban.dispatch_in_gateway` instead of asking the gateway's own control socket, which stalled the loop on POSIX and deadlocked it on Windows until the loop watchdog stopped the gateway with exit 75.
+
+0.30.0 adds `install.commit` to `/deskrpg/info`: the git commit of the plugin code the gateway loaded, read from the plugin folder's `.git` files (null when there is none). DeskRPG uses it to tell container installs still on the old compose file, which track the plugin's development branch, to download the new compose once.
+
+0.29.1 makes `kanban.worker_launch` match how Hermes actually starts workers: on a multiplexed root gateway every worker loses the gateway's PYTHONPATH, so `HERMES_BIN` is required; on a standalone profile gateway the answer can depend on the assignee and is reported as `ok: null, reason: "assignee_dependent"`.
+
+0.29.0 adds `capabilities_fingerprint` and `started_at` to `/deskrpg/info` and to every `/deskrpg/events` page, so DeskRPG notices a changed Hermes core or a gateway restart on its next poll without extra requests.
+
+0.28.2 records a Hub skill removal as `hub_uninstall` in the skill job log instead of `hub_update`.
+
+0.28.1 stops a profile from approving its own work: if the reviewer profile submits a card it implemented, or a reviewer run picks up its own submission, the card waits for a person instead of being approved by the same profile. `/deskrpg/info` now reports whether the gateway can start kanban workers (`kanban.worker_launch`): on an upstream package-manager runtime the dispatcher needs `HERMES_BIN` pointing at the Hermes launcher, otherwise workers exit with `No module named 'hermes_cli'`. The patched-core migration steps are rewritten to match a real move to upstream.
+
+0.28.0 keeps NPC skill management working on upstream Hermes main. Skill jobs (hub install, uninstall, update and curator runs) run the documented `hermes -p <profile> skills|curator` commands in a child process with gateway credentials removed from its environment. Skill management is split into per-feature capabilities (`profile_skill_read`, `profile_skill_edit`, `profile_skill_hub`, `profile_curator`, `profile_learning_graph`; `profile_skill_admin` is still announced when all five are on), so one missing Hermes internal no longer turns the whole screen off. Editing a skill's reference files and permanently deleting a single archived skill are removed (`410 skill_reference_edit_removed`, `410 skill_purge_removed`): ask the employee in chat to change reference files, and purge from the Hermes dashboard or `hermes -p <profile> curator purge`. `review_migrate --drop-patch-triggers` removes the patched core's approval triggers after moving policies.
+
+0.27.0 enforces approval policies on upstream Hermes without a core patch (capability `review_hooks_v1`). Cards and swarms can carry a human, agent or mixed (AI review, then a person) policy, kept in a plugin-owned store outside Hermes' schema next to the shared kanban home. Worker hooks stop an implementer from completing its own card and route it through `kanban_request_review`; a card waiting for a person sits in `review` with no assignee until someone approves or sends it back through the existing `approve` and `request_changes` actions. AI reviewer approvals and rejections are recorded, boards get a default policy (`GET`/`PUT /deskrpg/kanban/boards/{slug}/default-policy`), `/deskrpg/info` lists profiles that would run without the hooks, and `python -m deskrpg_plugin.review_migrate` moves policies from a patched core. On a patched core the existing policy path is still used.
 
 0.26.0 runs on upstream Hermes main without Dante Labs patches for everything except review policies: the required Hermes API list no longer names underscore internals, status and field edits go through the public kanban verbs the upstream dashboard uses (`reclaim_task`, `promote_task`, `edit_task`), reopening a finished card whose descendants are running no longer fails, and PyYAML is declared in `python_dependencies` because upstream Hermes no longer ships it. `hermes plugins enable deskrpg` prepares the dependency. CI also runs the integration suite against upstream main.
 

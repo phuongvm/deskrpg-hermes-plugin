@@ -385,3 +385,68 @@ async def test_켜짐_판정은_호출마다_다시_읽는다(aiohttp_client, fa
     resp = await client.post("/deskrpg/worker-plugin", json={"profiles": ["sophie"]})
     assert resp.status == 200
     assert (await (await client.get("/deskrpg/info")).json())["worker_plugin"]["propagation"] == "enabled"
+
+
+# --- Approval hook coverage (`/deskrpg/info` kanban.review_hooks) ---------------------------------------------------
+
+
+async def test_info_reports_profiles_that_would_run_without_the_approval_hooks(
+    aiohttp_client, fake_api, propagation_on
+):
+    _profile(fake_api, "sophie")
+    _profile(fake_api, "oliver")
+    worker_plugin.ensure(fake_api, "oliver")  # linked and enabled
+    client = await _client(aiohttp_client, fake_api)
+
+    body = await (await client.get("/deskrpg/info")).json()
+
+    assert body["kanban"]["review_hooks"] == {"propagation": True, "profiles_without_plugin": ["sophie"]}
+
+
+async def test_info_says_when_propagation_is_off(aiohttp_client, fake_api):
+    _profile(fake_api, "sophie")
+    client = await _client(aiohttp_client, fake_api)
+
+    body = await (await client.get("/deskrpg/info")).json()
+
+    assert body["kanban"]["review_hooks"] == {"propagation": False, "profiles_without_plugin": ["sophie"]}
+
+
+async def test_info_reports_null_when_coverage_cannot_be_told(aiohttp_client, fake_api, monkeypatch):
+    monkeypatch.setattr(worker_plugin, "report", lambda api: (_ for _ in ()).throw(OSError("unreadable")))
+    client = await _client(aiohttp_client, fake_api)
+
+    resp = await client.get("/deskrpg/info")
+
+    assert resp.status == 200
+    assert (await resp.json())["kanban"]["review_hooks"] is None
+
+
+async def test_the_owner_route_lists_profiles_off_the_event_loop(aiohttp_client, fake_api, propagation_on):
+    # Hermes' list_profiles checks whether each profile's gateway runs by asking the gateway's control pipe. From the
+    # gateway's own event loop that pipe can never answer: a native Windows gateway froze here until its loop watchdog
+    # killed it (2026-09-27, WinServer, the wizard's "apply to employees" step).
+    import asyncio
+    import time
+
+    _profile(fake_api, "sophie")
+    real = fake_api.list_profiles
+    fake_api.list_profiles = lambda *a, **k: time.sleep(0.4) or real(*a, **k)
+    client = await _client(aiohttp_client, fake_api)
+
+    lags, done = [], asyncio.Event()
+
+    async def tick():
+        while not done.is_set():
+            start = time.monotonic()
+            await asyncio.sleep(0.02)
+            lags.append(time.monotonic() - start - 0.02)
+
+    ticker = asyncio.create_task(tick())
+    try:
+        resp = await client.post("/deskrpg/worker-plugin")
+    finally:
+        done.set()
+        await ticker
+    assert resp.status == 200
+    assert max(lags, default=0.0) < 0.2, f"event loop blocked for {max(lags):.2f}s"

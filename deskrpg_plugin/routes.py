@@ -4,6 +4,7 @@
 require_auth 로 감싸므로, 핸들러를 빠뜨릴 자리가 없다.
 """
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -163,6 +164,8 @@ ROUTES = [
     ("GET", "/deskrpg/kanban/boards", "kanban_list_boards", Scope.DEFAULT),
     ("POST", "/deskrpg/kanban/boards", "kanban_create_board", Scope.DEFAULT),
     ("PATCH", "/deskrpg/kanban/boards/{slug}", "kanban_patch_board", Scope.DEFAULT),
+    ("GET", "/deskrpg/kanban/boards/{slug}/default-policy", "kanban_get_board_default_policy", Scope.DEFAULT),
+    ("PUT", "/deskrpg/kanban/boards/{slug}/default-policy", "kanban_board_default_policy", Scope.DEFAULT),
     ("GET", "/deskrpg/kanban/board", "kanban_get_board", Scope.DEFAULT),
     ("POST", "/deskrpg/kanban/tasks", "kanban_create_task", Scope.DEFAULT),
     ("GET", "/deskrpg/kanban/tasks/{task_id}", "kanban_get_task", Scope.DEFAULT),
@@ -317,6 +320,8 @@ _HANDLERS = {
     "kanban_list_boards": lambda api: _kanban_board.list_boards_handler(api),
     "kanban_create_board": lambda api: _kanban_board.create_board_handler(api),
     "kanban_patch_board": lambda api: _kanban_board.patch_board_handler(api),
+    "kanban_board_default_policy": lambda api: _kanban_board.default_policy_handler(api),
+    "kanban_get_board_default_policy": lambda api: _kanban_board.get_default_policy_handler(api),
     "kanban_get_board": lambda api: _kanban_board.get_board_handler(api),
     "kanban_create_task": lambda api: _kanban_board.create_task_handler(api),
     "kanban_get_task": lambda api: _kanban_board.get_task_handler(api),
@@ -473,19 +478,16 @@ def _info_timezone(api):
 
 
 def _info_dispatcher_present(api) -> bool:
-    """디스패처(게이트웨이의 kanban.dispatch_in_gateway)가 살아 있는지. 예외는 fail-open(true).
+    """Whether this gateway runs the kanban dispatcher (`kanban.dispatch_in_gateway`, default true).
 
-    Hermes 의 `_check_dispatcher_presence` 자체도 fail-open 이다 — 경고를 놓치는 쪽이
-    멀쩡한 게이트웨이에 "디스패처 없음" 을 외치는 쪽보다 낫다.
+    Answered in process: this route is served by the gateway, so the gateway is alive. Hermes'
+    `_check_dispatcher_presence` finds that out by asking the gateway's control socket — from here that is the
+    gateway asking itself on its own event loop, which on Windows (a pipe read with no timeout) deadlocked the loop
+    until the watchdog killed the gateway, and on POSIX stalls the loop for the socket timeout.
     """
-    probe = getattr(api, "_check_dispatcher_presence", None)
-    if probe is None:  # optional Hermes internal — without it, assume present (fail-open)
-        return True
-    try:
-        present, _message = probe(api.get_hermes_home())
-        return bool(present)
-    except Exception:
-        return True
+    from .kanban_ops import _dispatch_in_gateway
+
+    return _dispatch_in_gateway(api)
 
 
 _FALSY = {"", "0", "false", "no", "off"}
@@ -498,6 +500,37 @@ def _info_worker_plugin(api):
         return _worker_plugin.report(api)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[deskrpg] worker plugin check failed: %s", type(exc).__name__)
+        return None
+
+
+def _info_review_hooks(api):
+    """Profiles that would run kanban work without the approval hooks. None when it cannot be told."""
+    try:
+        return _worker_plugin.review_hooks_report(api)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[deskrpg] review hooks coverage check failed: %s", type(exc).__name__)
+        return None
+
+
+def _info_install():
+    """Which plugin commit is running (`install`). `commit` is None when it cannot be told."""
+    try:
+        from . import install_info
+
+        return install_info.report()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[deskrpg] install check failed: %s", type(exc).__name__)
+        return {"commit": None}
+
+
+def _info_worker_launch():
+    """Whether kanban workers can start (`worker_launch`). None when it cannot be told."""
+    try:
+        from . import worker_launch
+
+        return worker_launch.report()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[deskrpg] worker launch check failed: %s", type(exc).__name__)
         return None
 
 
@@ -525,33 +558,59 @@ def _info_dashboard_url(api):
     return url if isinstance(url, str) and url.startswith(("https://", "http://")) else None
 
 
+# How long `/deskrpg/info` waits for a slow check before answering "not known yet", and how long an answer is reused.
+INFO_PROBE_TIMEOUT_SECONDS = 2.0
+INFO_PROBE_TTL_SECONDS = 30.0
+
+
+def _info_body(api) -> dict:
+    """The parts of `/deskrpg/info` that only read config, files and symbols. Run off the event loop."""
+    from .contract_fields import capabilities, freshness
+
+    return {
+        "plugin": "deskrpg",
+        "version": PLUGIN_VERSION,
+        "routes": [f"{m} {p}" for m, p, _h, _s in routes_for(api)],
+        "capabilities": list(capabilities(api)),
+        **freshness(api),
+        "timezone": _info_timezone(api),
+        "dashboard_url": _info_dashboard_url(api),
+        "artifact_max_bytes": _artifact_upload_max_bytes(api),
+        "install": _info_install(),
+        "kanban": {
+            "dispatcher_present": _info_dispatcher_present(api),
+            "attachments": True,
+            # 첨부는 요청 본문에 실려 오므로 api_server 의 본문 상한과 칸반 자체 상한
+            # 중 작은 쪽이 실효 상한이다. 클라이언트가 이 값으로 업로드 전에 거른다.
+            "attachment_max_bytes": min(int(api.MAX_REQUEST_BYTES), int(api.KANBAN_ATTACHMENT_MAX_BYTES)),
+        },
+    }
+
+
 def _make_info(api):
     from aiohttp import web
 
-    from .contract_fields import capabilities
+    from .common import run_blocking
+    from .slow_probe import SlowProbe
+
+    # Checks that shell out (worker launch) or walk every profile (plugin links): waited for briefly, then cached.
+    worker_launch_probe = SlowProbe(_info_worker_launch, ttl=INFO_PROBE_TTL_SECONDS)
+    profiles_probe = SlowProbe(
+        lambda: {"worker_plugin": _info_worker_plugin(api), "review_hooks": _info_review_hooks(api)},
+        ttl=INFO_PROBE_TTL_SECONDS,
+    )
 
     async def handler(request):
-        return web.json_response(
-            {
-                "plugin": "deskrpg",
-                "version": PLUGIN_VERSION,
-                "routes": [f"{m} {p}" for m, p, _h, _s in routes_for(api)],
-                "capabilities": list(capabilities(api)),
-                "timezone": _info_timezone(api),
-                "dashboard_url": _info_dashboard_url(api),
-                "artifact_max_bytes": _artifact_upload_max_bytes(api),
-                "worker_plugin": _info_worker_plugin(api),
-                "kanban": {
-                    "dispatcher_present": _info_dispatcher_present(api),
-                    "attachments": True,
-                    # 첨부는 요청 본문에 실려 오므로 api_server 의 본문 상한과 칸반 자체 상한
-                    # 중 작은 쪽이 실효 상한이다. 클라이언트가 이 값으로 업로드 전에 거른다.
-                    "attachment_max_bytes": min(
-                        int(api.MAX_REQUEST_BYTES), int(api.KANBAN_ATTACHMENT_MAX_BYTES)
-                    ),
-                },
-            }
+        body = await run_blocking(_info_body, api)
+        launch, profiles = await asyncio.gather(
+            worker_launch_probe.get(INFO_PROBE_TIMEOUT_SECONDS),
+            profiles_probe.get(INFO_PROBE_TIMEOUT_SECONDS),
         )
+        profiles = profiles or {}
+        body["worker_plugin"] = profiles.get("worker_plugin")
+        body["kanban"]["review_hooks"] = profiles.get("review_hooks")
+        body["kanban"]["worker_launch"] = launch
+        return web.json_response(body)
 
     return handler
 
@@ -573,17 +632,16 @@ _OPTIONAL_ROUTES = {
     "kanban_blackboard": "latest_blackboard",
     "get_toolsets": _contract_fields.has_toolset_symbols,
     "get_skills": _contract_fields.has_skill_symbols,
-    "skill_detail": _contract_fields.has_skill_admin_symbols,
-    "skill_file_get": _contract_fields.has_skill_admin_symbols,
-    "skill_create": _contract_fields.has_skill_admin_symbols,
-    "skill_bulk_enabled": _contract_fields.has_skill_admin_symbols,
-    "skill_file_put": _contract_fields.has_skill_admin_symbols,
-    "skill_enabled": _contract_fields.has_skill_admin_symbols,
-    "skill_archive_list": _contract_fields.has_skill_admin_symbols,
-    "skill_restore": _contract_fields.has_skill_admin_symbols,
-    "skill_purge": _contract_fields.has_skill_admin_symbols,
-    "skill_pinned": _contract_fields.has_skill_admin_symbols,
-    "skill_archive": _contract_fields.has_skill_admin_symbols,
+    "skill_detail": _contract_fields.has_skill_read,
+    "skill_file_get": _contract_fields.has_skill_read,
+    "skill_create": _contract_fields.has_skill_edit,
+    "skill_bulk_enabled": _contract_fields.has_skill_edit,
+    "skill_file_put": _contract_fields.has_skill_edit,
+    "skill_enabled": _contract_fields.has_skill_edit,
+    "skill_archive_list": _contract_fields.has_skill_read,
+    "skill_restore": _contract_fields.has_skill_edit,
+    "skill_pinned": _contract_fields.has_skill_edit,
+    "skill_archive": _contract_fields.has_skill_edit,
     "get_tool_providers": _contract_fields.has_tool_provider_symbols,
     "put_tool_provider": _contract_fields.has_tool_provider_symbols,
     "put_provider_key": "PROVIDER_REGISTRY",
@@ -592,21 +650,21 @@ _OPTIONAL_ROUTES = {
     "oauth_poll": _contract_fields.has_oauth_symbols,
     "oauth_cancel": _contract_fields.has_oauth_symbols,
     "oauth_disconnect": _contract_fields.has_oauth_symbols,
-    # 0.15.0 — 스킬 관리 라우트 전부가 `profile_skill_admin` capability 와 같은 판정을 쓴다.
-    "skill_hub_search": _contract_fields.has_skill_admin_symbols,
-    "skill_hub_preview": _contract_fields.has_skill_admin_symbols,
-    "skill_hub_install": _contract_fields.has_skill_admin_symbols,
-    "skill_hub_job": _contract_fields.has_skill_admin_symbols,
-    "skill_hub_uninstall": _contract_fields.has_skill_admin_symbols,
-    "skill_hub_update": _contract_fields.has_skill_admin_symbols,
-    "curator_status": _contract_fields.has_skill_admin_symbols,
-    "curator_paused": _contract_fields.has_skill_admin_symbols,
-    "curator_run": _contract_fields.has_skill_admin_symbols,
-    "curator_job": _contract_fields.has_skill_admin_symbols,
-    "learning_graph": _contract_fields.has_skill_admin_symbols,
-    "learning_node_get": _contract_fields.has_skill_admin_symbols,
-    "learning_node_put": _contract_fields.has_skill_admin_symbols,
-    "learning_node_delete": _contract_fields.has_skill_admin_symbols,
+    # Skill management routes share the per-feature checks with their capabilities (contract_fields.SKILL_CHECKS).
+    "skill_hub_search": _contract_fields.has_skill_hub,
+    "skill_hub_preview": _contract_fields.has_skill_hub,
+    "skill_hub_install": _contract_fields.has_skill_hub,
+    "skill_hub_job": _contract_fields.has_skill_hub,
+    "skill_hub_uninstall": _contract_fields.has_skill_hub,
+    "skill_hub_update": _contract_fields.has_skill_hub,
+    "curator_status": _contract_fields.has_curator,
+    "curator_paused": _contract_fields.has_curator,
+    "curator_run": _contract_fields.has_curator,
+    "curator_job": _contract_fields.has_curator,
+    "learning_graph": _contract_fields.has_learning_graph,
+    "learning_node_get": _contract_fields.has_learning_graph,
+    "learning_node_put": _contract_fields.has_learning_graph,
+    "learning_node_delete": _contract_fields.has_learning_graph,
     # 0.17.0 — MCP 관리 라우트 전부가 `profile_mcp_admin` capability 와 같은 판정을 쓴다.
     "mcp_list": _contract_fields.has_mcp_admin_symbols,
     "mcp_create": _contract_fields.has_mcp_admin_symbols,
