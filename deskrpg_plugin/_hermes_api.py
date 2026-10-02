@@ -255,7 +255,6 @@ OPTIONAL_SPEC = (
     ("tools.mcp_tool_lifecycle", ("_stop_mcp_loop_if_idle", "shutdown_mcp_servers")),
     ("tools.mcp_tool_agent", ("reprobe_tool_availability",)),
     ("tools.registry", (("registry", "mcp_registry"),)),
-    ("gateway.run", ("_profile_runtime_scope",)),
     ("hermes_cli.mcp_catalog", (
         ("list_catalog", "mcp_list_catalog"), ("get_entry", "mcp_get_catalog_entry"),
         ("card_install_config", "mcp_card_install_config"),
@@ -319,5 +318,17 @@ def load() -> types.SimpleNamespace:
             module = None
         for src, dst in _pairs(names):
             resolved[dst] = getattr(module, src, None) if module is not None else None
+
+    # 0.17.0 MCP scope: gateway.run is resolved lazily on call to avoid
+    # a cross-thread import deadlock when gateway.run discovers plugins during startup.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _profile_runtime_scope(profile_home, *args, **kwargs):
+        import gateway.run
+        with gateway.run._profile_runtime_scope(profile_home, *args, **kwargs):
+            yield
+
+    resolved["_profile_runtime_scope"] = _profile_runtime_scope
 
     return types.SimpleNamespace(**resolved)
