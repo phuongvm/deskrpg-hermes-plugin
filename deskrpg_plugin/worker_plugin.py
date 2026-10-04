@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -42,6 +43,8 @@ PROPAGATION_ENV = "DESKRPG_WORKER_PROPAGATION"
 PROPAGATION_CONFIG_KEY = "worker_propagation"
 DISABLED_ERROR = "worker_propagation_disabled"
 _TRUTHY = {"1", "true", "yes", "on"}
+_link_locks_guard = threading.Lock()
+_link_locks: dict[Path, threading.Lock] = {}
 
 DISABLED_DETAIL = (
     "Worker propagation is off. When enabled, this plugin symlinks itself into every profile's "
@@ -176,6 +179,14 @@ def review_hooks_report(api) -> dict:
 
 
 def _ensure_link(link: Path) -> str:
+    key = link.absolute()
+    with _link_locks_guard:
+        lock = _link_locks.setdefault(key, threading.Lock())
+    with lock:
+        return _ensure_link_locked(link)
+
+
+def _ensure_link_locked(link: Path) -> str:
     state = _link_state(link)
     if state == "linked":
         return "present"
