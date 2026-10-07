@@ -29,8 +29,10 @@ def _fake_hermes(monkeypatch, *, registry, auth, curated=None, mdev=None):
 
 @pytest.fixture(autouse=True)
 def _no_canonical_catalog(monkeypatch):
-    """Default to a build without `provider_catalog` so the registry fakes stay authoritative."""
+    """Default to a build without the picker helpers so the registry fakes stay authoritative,
+    even in the venv where the real Hermes is installed."""
     monkeypatch.setitem(sys.modules, "hermes_cli.provider_catalog", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.models", None)
 
 
 def _fake_canonical(monkeypatch, descriptors, picker_auth=None):
