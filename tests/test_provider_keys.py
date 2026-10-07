@@ -94,3 +94,18 @@ async def test_레지스트리가_없는_빌드에는_라우트와_capability_�
     assert (await client.put("/p/noah/deskrpg/provider-keys/openai", json={"value": SECRET})).status == 404
     caps = (await (await client.get("/deskrpg/info")).json())["capabilities"]
     assert "profile_provider_keys" not in caps
+
+
+async def test_openrouter_key_uses_the_canonical_descriptor_outside_the_registry(aiohttp_client, fake_api, monkeypatch):
+    # The catalog lists openrouter with an API-key field, but Hermes keeps it out of PROVIDER_REGISTRY.
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.provider_catalog", types.SimpleNamespace(provider_catalog=lambda: [
+        types.SimpleNamespace(slug="openrouter", label="OpenRouter", auth_type="api_key",
+                              api_key_env_vars=("OPENROUTER_API_KEY",))]))
+    fake_api.create_profile("noah")
+    client = await _client(aiohttp_client, fake_api)
+    resp = await client.put("/p/noah/deskrpg/provider-keys/openrouter", json={"value": SECRET})
+    assert await resp.json() == {"configured": True, "envVar": "OPENROUTER_API_KEY"}
+    assert (await client.put("/p/noah/deskrpg/provider-keys/nope", json={"value": SECRET})).status == 404

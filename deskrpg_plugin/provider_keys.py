@@ -14,6 +14,7 @@ import re
 from aiohttp import web
 
 from . import envfile
+from .catalog import canonical_providers
 from .common import RequestError, guarded, run_blocking
 from .cron import resolve_profile_home
 
@@ -26,6 +27,10 @@ _VALUE_RE = re.compile(r"^[A-Za-z0-9._~+/=:@,%!*^()\[\]{}|<>?-]{8,512}$")
 def _provider(api, provider_id: str):
     registry = getattr(api, "PROVIDER_REGISTRY", None) or {}
     pcfg = registry.get(provider_id)
+    if pcfg is None:
+        # `openrouter` is listed by the catalog but lives outside the registry; its descriptor
+        # carries the same `auth_type`/`api_key_env_vars` fields, still chosen by Hermes, not the client.
+        pcfg = next((d for d in canonical_providers() or () if d.slug == provider_id), None)
     if pcfg is None:
         raise RequestError(404, "provider_not_found", provider_id)
     return pcfg

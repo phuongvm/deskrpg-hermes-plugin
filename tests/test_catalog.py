@@ -27,6 +27,25 @@ def _fake_hermes(monkeypatch, *, registry, auth, curated=None, mdev=None):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_canonical_catalog(monkeypatch):
+    """Default to a build without `provider_catalog` so the registry fakes stay authoritative."""
+    monkeypatch.setitem(sys.modules, "hermes_cli.provider_catalog", None)
+
+
+def _fake_canonical(monkeypatch, descriptors, picker_auth=None):
+    monkeypatch.setitem(sys.modules, "hermes_cli.provider_catalog",
+                        types.SimpleNamespace(provider_catalog=lambda: list(descriptors)))
+    if picker_auth is not None:
+        rows = [{"id": pid, "authenticated": ok} for pid, ok in picker_auth.items()]
+        monkeypatch.setitem(sys.modules, "hermes_cli.models",
+                            types.SimpleNamespace(list_available_providers=lambda: rows))
+
+
+def _desc(slug, label, auth_type="api_key", env=()):
+    return types.SimpleNamespace(slug=slug, label=label, auth_type=auth_type, api_key_env_vars=env)
+
+
 def _cfg(name):
     return types.SimpleNamespace(id=name, name=name.title())
 
@@ -327,3 +346,49 @@ def test_the_fallback_merge_is_sorted_too(monkeypatch):
                  mdev={"gemini": ["gemini-2.5-pro", "gemini-3.8-flash"]})
     _fake_picker(monkeypatch, lambda pid: [])
     assert catalog._models_for("gemini") == ["gemini-3.8-flash", "gemini-2.5-pro"]
+
+
+def test_provider_list_is_the_hermes_picker_universe_in_its_order(monkeypatch):
+    # PROVIDER_REGISTRY holds a row per plugin alias (nebius, tokenfactory …), which showed
+    # "Nebius Token Factory" six times, and lacks openrouter/custom/moa (2026-10-07 staging).
+    nebius = types.SimpleNamespace(id="nebius-token-factory", name="Nebius Token Factory", auth_type="api_key",
+                                   api_key_env_vars=("NEBIUS_API_KEY",))
+    _fake_hermes(monkeypatch, registry={"nebius-token-factory": nebius, "nebius": nebius, "tokenfactory": nebius},
+                 auth={})
+    _fake_canonical(
+        monkeypatch,
+        [_desc("nous", "Nous Research", "oauth_device_code"), _desc("openrouter", "OpenRouter", env=("OPENROUTER_API_KEY",)),
+         _desc("moa", "Mixture of Agents", "virtual"), _desc("nebius-token-factory", "Nebius Token Factory",
+                                                            env=("NEBIUS_API_KEY",)), _desc("custom", "custom")],
+        picker_auth={"nous": False, "openrouter": False, "moa": False, "nebius-token-factory": False, "custom": False},
+    )
+    rows = catalog._provider_rows(types.SimpleNamespace(), profile="noah")
+    assert [r["id"] for r in rows] == ["nous", "openrouter", "moa", "nebius-token-factory", "custom"]
+    assert [r["name"] for r in rows].count("Nebius Token Factory") == 1
+    assert rows[1]["authType"] == "api_key" and rows[1]["envVars"] == ["OPENROUTER_API_KEY"]
+
+
+def test_authenticated_providers_come_first_keeping_hermes_order(monkeypatch):
+    # The picker decides openrouter (env key) and custom (base URL) itself; get_auth_status does not know them.
+    _fake_hermes(monkeypatch, registry={}, auth={})
+    _fake_canonical(monkeypatch, [_desc(p, p) for p in ("nous", "fireworks", "openrouter", "anthropic", "custom")],
+                    picker_auth={"nous": False, "fireworks": False, "openrouter": True, "anthropic": False,
+                                 "custom": True})
+    rows = catalog._provider_rows(None, profile="noah")
+    assert [(r["id"], r["authenticated"]) for r in rows] == [
+        ("openrouter", True), ("custom", True), ("nous", False), ("fireworks", False), ("anthropic", False)]
+
+
+def test_without_the_picker_auth_helper_auth_status_decides(monkeypatch):
+    _fake_hermes(monkeypatch, registry={}, auth={"anthropic": {"configured": True}})
+    _fake_canonical(monkeypatch, [_desc("nous", "Nous"), _desc("anthropic", "Anthropic")])
+    rows = catalog._provider_rows(None, profile="noah")
+    assert [(r["id"], r["authenticated"]) for r in rows] == [("anthropic", True), ("nous", False)]
+
+
+def test_older_builds_drop_alias_rows_from_the_registry(monkeypatch):
+    nebius = types.SimpleNamespace(id="nebius-token-factory", name="Nebius Token Factory")
+    _fake_hermes(monkeypatch, registry={"nebius-token-factory": nebius, "nebius": nebius, "nebius-tf": nebius,
+                                        "anthropic": _cfg("anthropic")}, auth={})
+    rows = catalog._provider_rows(None, profile="noah")
+    assert [r["id"] for r in rows] == ["nebius-token-factory", "anthropic"]
