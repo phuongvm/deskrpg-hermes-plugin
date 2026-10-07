@@ -60,31 +60,73 @@ def _auth_fields(api, pid: str, cfg, profile: str) -> dict:
     return {"authType": "external", "envVars": [], "cliCommand": command}
 
 
+def canonical_providers():
+    """The `hermes model` provider universe (`hermes_cli.provider_catalog`), or None on builds without it.
+
+    `PROVIDER_REGISTRY` is not that list: it also holds one row per plugin-provider alias
+    (`nebius`, `tokenfactory`, `meta`, `msl` … point at the same config), so walking it showed
+    "Nebius Token Factory" six times, and it lacks `openrouter`/`custom`/`moa`, which Hermes keeps
+    outside the registry (2026-10-07 staging: 78 registry keys vs 53 picker providers).
+    """
+    try:
+        from hermes_cli.provider_catalog import provider_catalog
+
+        return list(provider_catalog())
+    except Exception:
+        return None
+
+
+def _picker_auth() -> dict[str, bool] | None:
+    """`{id: authenticated}` exactly as the `hermes model` picker decides it, or None on old builds.
+
+    `get_auth_status` alone does not know `openrouter` (key in env) or `custom` (base URL in config).
+    """
+    try:
+        from hermes_cli.models import list_available_providers
+
+        return {str(p["id"]): bool(p.get("authenticated")) for p in list_available_providers()}
+    except Exception:
+        return None
+
+
+def _status_auth(get_auth_status, pid: str) -> bool:
+    try:
+        st = get_auth_status(pid) or {}
+        # `configured` 와 `logged_in` 은 프로바이더 종류마다 채워지는 쪽이 다르다
+        # (API 키형은 configured, OAuth 형은 logged_in). 둘 중 하나면 쓸 수 있다.
+        return bool(st.get("configured")) or bool(st.get("logged_in"))
+    except Exception:
+        # 한 프로바이더의 상태 조회 실패가 목록 전체를 죽이면 안 된다.
+        # 모르면 "인증 안 됨" 으로 두되, 그 사실이 화면에 보인다.
+        return False
+
+
+def _provider_entries():
+    """(id, display name, auth config) in Hermes' order — canonical list, else the de-aliased registry."""
+    descriptors = canonical_providers()
+    if descriptors is not None:
+        return [(d.slug, d.label or d.slug, d) for d in descriptors]
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    # Older builds: alias rows share the canonical row's config, whose `id` is the canonical name.
+    return [
+        (pid, getattr(cfg, "name", pid) or pid, cfg)
+        for pid, cfg in PROVIDER_REGISTRY.items()
+        if getattr(cfg, "id", pid) == pid
+    ]
+
+
 def _provider_rows(api, profile: str) -> list[dict]:
     """프로바이더 목록 + 이 프로필의 인증 상태."""
-    from hermes_cli.auth import PROVIDER_REGISTRY, get_auth_status
+    from hermes_cli.auth import get_auth_status
 
+    picker_auth = _picker_auth() or {}
     rows = []
-    for pid, cfg in PROVIDER_REGISTRY.items():
-        authed = False
-        try:
-            st = get_auth_status(pid) or {}
-            # `configured` 와 `logged_in` 은 프로바이더 종류마다 채워지는 쪽이 다르다
-            # (API 키형은 configured, OAuth 형은 logged_in). 둘 중 하나면 쓸 수 있다.
-            authed = bool(st.get("configured")) or bool(st.get("logged_in"))
-        except Exception:
-            # 한 프로바이더의 상태 조회 실패가 목록 전체를 죽이면 안 된다.
-            # 모르면 "인증 안 됨" 으로 두되, 그 사실이 화면에 보인다.
-            pass
-        rows.append(
-            {
-                "id": pid,
-                "name": getattr(cfg, "name", pid) or pid,
-                "authenticated": authed,
-                **_auth_fields(api, pid, cfg, profile),
-            }
-        )
-    rows.sort(key=lambda r: (not r["authenticated"], r["id"]))
+    for pid, name, cfg in _provider_entries():
+        authed = picker_auth[pid] if pid in picker_auth else _status_auth(get_auth_status, pid)
+        rows.append({"id": pid, "name": name, "authenticated": authed, **_auth_fields(api, pid, cfg, profile)})
+    # Usable ones first; within each group keep Hermes' picker order (stable sort).
+    rows.sort(key=lambda r: not r["authenticated"])
     return rows
 
 
@@ -159,7 +201,7 @@ def _catalog_for_home(api, home, profile: str) -> dict:
         providers = _provider_rows(api, profile=profile)
         models: dict[str, list[str]] = {}
         for row in providers:
-            # 인증된 프로바이더만 모델을 채운다. 79개 전부를 채우면 응답이 거대해지고
+            # 인증된 프로바이더만 모델을 채운다. 50여 개 전부를 채우면 응답이 거대해지고
             # models.dev 왕복이 그만큼 늘어난다 — 화면이 실제로 고를 수 있는 것만 준다.
             if row["authenticated"]:
                 models[row["id"]] = _models_for(row["id"])
