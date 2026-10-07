@@ -17,7 +17,7 @@ Connect [DeskRPG](https://github.com/dandacompany/deskrpg), a self-hosted virtua
 Python 3.11+ and Hermes Agent >=0.21.1 with the API Server enabled. Runtime dependencies are aiohttp and PyYAML, provided by Hermes. Internal Hermes API availability is checked during registration.
 
 ```sh
-plugin_sha=$(git ls-remote https://github.com/dandacompany/deskrpg-hermes-plugin.git refs/tags/v0.31.0 | cut -f1)
+plugin_sha=$(git ls-remote https://github.com/dandacompany/deskrpg-hermes-plugin.git refs/tags/v0.31.1 | cut -f1)
 hermes plugins install https://github.com/dandacompany/deskrpg-hermes-plugin --ref "$plugin_sha"
 hermes plugins enable deskrpg
 hermes plugins doctor deskrpg
@@ -167,6 +167,8 @@ Skill management is announced per feature (`profile_skill_read`, `profile_skill_
 `profile_skill_admin` is still announced when all five are on.
 
 ## Release
+
+0.31.1 lists the same providers as `hermes model`, in its order: the catalog walks Hermes' `provider_catalog` instead of `PROVIDER_REGISTRY`, which repeated a provider once per alias (Nebius Token Factory and Meta Model API six times each) and left out OpenRouter, Mixture of Agents and custom endpoints. Authentication comes from the picker's own check, so an OpenRouter key or a configured custom base URL counts. Authenticated providers still come first. `PUT provider-keys/openrouter` now stores `OPENROUTER_API_KEY`.
 
 0.31.0 adds `POST /p/{profile}/deskrpg/skill-invocation` (capability `skill_invocation`). DeskRPG chat skill chips send skill names and an instruction; the plugin builds the same message Hermes' TUI and messaging gateway build for `/skill …` (one skill or up to five stacked) with Hermes' public skill-command builders, scoped to the profile's home. Unknown skills answer 404 `skill_not_found`, skills disabled for the profile or for the API server platform 409 `skill_disabled`, and a skill that cannot be loaded 422 `skill_load_failed` — the chat is never sent without the skill.
 
