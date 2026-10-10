@@ -8,13 +8,22 @@
 로그에 넣지 않는다 — 게이트웨이 로그는 오래 남고 누가 보는지 모른다.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import functools
 import logging
 import re
+from typing import TYPE_CHECKING, Any
 
-from aiohttp import web
+if TYPE_CHECKING:
+    from aiohttp import web
+else:
+    try:
+        from aiohttp import web
+    except Exception:  # noqa: BLE001
+        web = None
 
 logger = logging.getLogger("deskrpg_plugin")
 

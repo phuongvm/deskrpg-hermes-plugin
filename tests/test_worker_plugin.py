@@ -49,6 +49,12 @@ def _config(fake_api, name):
     return yaml.safe_load((fake_api.get_profile_dir(name) / "config.yaml").read_text(encoding="utf-8"))
 
 
+def _link_is_connected(link: Path) -> bool:
+    if os.name == "nt":
+        return link.is_symlink() or (link.is_dir() and not link.is_file())
+    return link.is_symlink()
+
+
 # ── 판정 ────────────────────────────────────────────────────────────────────
 
 
@@ -74,8 +80,8 @@ def test_ensure_는_루트로_가는_링크와_활성화를_만든다(fake_api):
 
     assert out == {"profile": "sophie", "link": "created", "enabled": "added"}
     link = _link(fake_api, "sophie")
-    # 사본이 아니라 링크다 — 루트를 올리면 모든 워커가 같은 버전을 쓴다.
-    assert link.is_symlink()
+    # 사본이 아니라 링크다 — 루트를 올리면 모든 워커가 같은 버전을 쓴다. (Windows 는 junction 허용)
+    assert link.is_symlink() if os.name != "nt" else (link.is_symlink() or link.is_dir())
     assert link.resolve() == worker_plugin.plugin_root()
     cfg = _config(fake_api, "sophie")
     assert cfg["plugins"]["enabled"] == ["danteterm-activity", "deskrpg"]  # 기존 항목·순서 보존
@@ -184,7 +190,16 @@ def test_끊어진_링크는_다시_건다(fake_api, tmp_path):
     _profile(fake_api, "sophie")
     link = _link(fake_api, "sophie")
     link.parent.mkdir(parents=True)
-    os.symlink(tmp_path / "gone", link, target_is_directory=True)
+    try:
+        os.symlink(tmp_path / "gone", link, target_is_directory=True)
+    except OSError:
+        if os.name == "nt":
+            import _winapi
+            (tmp_path / "gone").mkdir(parents=True, exist_ok=True)
+            _winapi.CreateJunction(str(tmp_path / "gone"), str(link))
+            (tmp_path / "gone").rmdir()
+        else:
+            raise
     assert worker_plugin.status(fake_api, "sophie")["link"] == "missing"
 
     out = worker_plugin.ensure(fake_api, "sophie")
@@ -271,7 +286,7 @@ async def test_소유자_라우트는_지정한_프로필만_고친다(aiohttp_c
     assert resp.status == 200
     body = await resp.json()
     assert body["results"] == [{"profile": "sophie", "link": "created", "enabled": "added"}]
-    assert _link(fake_api, "sophie").is_symlink()
+    assert _link_is_connected(_link(fake_api, "sophie"))
     assert not _link(fake_api, "oliver").exists()
 
 
@@ -312,7 +327,7 @@ async def test_프로필을_만들면_워커에서도_뜨게_해_둔다(aiohttp_
     assert resp.status == 201
     body = await resp.json()
     assert body["workerPlugin"] == {"profile": "mia", "link": "created", "enabled": "added"}
-    assert _link(fake_api, "mia").is_symlink()
+    assert _link_is_connected(_link(fake_api, "mia"))
 
 
 async def test_워커_준비가_실패해도_프로필_생성은_201_이다(aiohttp_client, fake_api, propagation_on, monkeypatch):
@@ -408,7 +423,7 @@ async def test_루트_config_로_켜면_소유자_라우트가_적용한다(aioh
     resp = await client.post("/deskrpg/worker-plugin", json={"profiles": ["sophie"]})
 
     assert resp.status == 200
-    assert _link(fake_api, "sophie").is_symlink()
+    assert _link_is_connected(_link(fake_api, "sophie"))
 
 
 async def test_꺼도_이미_걸린_링크와_활성화_항목은_지우지_않는다(aiohttp_client, fake_api):
@@ -419,7 +434,7 @@ async def test_꺼도_이미_걸린_링크와_활성화_항목은_지우지_않�
     assert (await client.post("/deskrpg/worker-plugin")).status == 409
     body = await (await client.get("/deskrpg/info")).json()
 
-    assert _link(fake_api, "sophie").is_symlink()
+    assert _link_is_connected(_link(fake_api, "sophie"))
     assert _config(fake_api, "sophie")["plugins"]["enabled"] == ["deskrpg"]
     assert body["worker_plugin"] == {"missing": [], "propagation": "disabled"}
 
