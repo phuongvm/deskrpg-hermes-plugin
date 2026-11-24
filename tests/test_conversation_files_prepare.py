@@ -124,3 +124,106 @@ def test_http_lease_uses_granted_session_when_ancestor_also_has_binding(tmp_path
     grant = rt.issue_grant(f['id'], 'dm', 'alice', 'key', 'sid')
     prepared = rt.prepare(grant['grant'], 'new-request', 'alice')
     assert rt.store.renew_lease(prepared['leaseId'], 'alice', 'sid', 'new-request')['leaseId'] == prepared['leaseId']
+
+
+def test_persistence_reader_enables_runtime_without_legacy_lineage_methods(tmp_path):
+    """Hermes 0.23.3+ removed lineage methods from hermes_state.SessionDB; use open_persistence_reader."""
+    from deskrpg_plugin.conversation_files_prepare import FileRuntime, available
+
+    home = tmp_path / 'profiles' / 'alice'
+    home.mkdir(parents=True)
+    (home / 'state.db').touch()
+
+    events = []
+
+    class SlimLegacySessionDB:
+        def __init__(self, *_a, **_kw):
+            raise AssertionError('legacy SessionDB must not be opened when open_persistence_reader is available')
+
+        def get_session(self, _sid):
+            return None
+
+    class FakeRecord:
+        def __init__(self, sid):
+            self._sid = sid
+
+        def as_session_row(self):
+            return {'id': self._sid}
+
+    class FakeSessionsRepo:
+        def get(self, sid):
+            return FakeRecord(sid) if sid in {'root', 'child', 'branch', 'delegate'} else None
+
+    class FakeLineageRepo:
+        def resolve_resume_target(self, sid):
+            return 'child' if sid == 'root' else sid
+
+        def chain(self, sid):
+            return ('root', 'child') if sid == 'root' else (sid,)
+
+        def lineage(self, sid):
+            return ('root', 'child') if sid in {'root', 'child'} else (sid,)
+
+    @contextlib.contextmanager
+    def fake_open_reader(db_path):
+        events.append(('open', str(db_path)))
+        store = SimpleNamespace(
+            ready=lambda: events.append(('ready', str(db_path))),
+            sessions=FakeSessionsRepo(),
+            lineage=FakeLineageRepo(),
+        )
+        try:
+            yield store
+        finally:
+            events.append(('close', str(db_path)))
+
+    api = SimpleNamespace(
+        get_profile_dir=lambda p: tmp_path if p == 'default' else tmp_path / 'profiles' / p,
+        profile_exists=lambda p: p == 'alice',
+        get_hermes_home=lambda: home,
+        validate_profile_name=lambda p: None,
+        SessionDB=SlimLegacySessionDB,
+        open_persistence_reader=None,
+        set_hermes_home_override=lambda p: None,
+        reset_hermes_home_override=lambda t: None,
+        install_profile_terminal_scope=lambda p: None,
+        reset_terminal_scope=lambda t: None,
+        terminal_env=lambda name, default='': 'local' if name == 'TERMINAL_ENV' else default,
+        set_session_vars=lambda **kw: None,
+        clear_session_vars=lambda t: None,
+        to_agent_visible_cache_path=str,
+        conversation_dispatch_tool=lambda *_a, **_kw: '{}',
+    )
+
+    # Without open_persistence_reader and without legacy lineage methods -> unavailable
+    assert available(api) is False
+
+    # With open_persistence_reader -> available and resolves lineage cleanly
+    api.open_persistence_reader = fake_open_reader
+    assert available(api) is True
+
+    rt = FileRuntime(api)
+    assert rt.resolve_session('alice', 'root') == 'child'
+    assert rt.authorized_sessions('alice', 'child') == ['root', 'child']
+    assert rt.authorized_sessions('alice', 'branch') == ['branch']
+    assert rt.authorized_sessions('alice', 'delegate') == ['delegate']
+
+    f, _ = rt.store.store_file('dm', 'r', 'a.pdf', 'application/pdf', [b'original'])
+    rt.issue_grant(f['id'], 'dm', 'alice', 'key', 'root')
+    rt.revoke_binding('dm', 'alice', 'child')
+    assert rt.store.list_bound('alice', ['root', 'child']) == []
+
+    # Every open called ready() and closed cleanly
+    opens = [e for e in events if e[0] == 'open']
+    readies = [e for e in events if e[0] == 'ready']
+    closes = [e for e in events if e[0] == 'close']
+    assert len(opens) == len(readies) == len(closes) == 6
+
+    # Reader open/ready failure maps to 502 attachment_prepare_failed and closes stack
+    @contextlib.contextmanager
+    def failing_open_reader(_db_path):
+        yield SimpleNamespace(ready=lambda: (_ for _ in ()).throw(RuntimeError('corrupt')))
+
+    api.open_persistence_reader = failing_open_reader
+    with pytest.raises(RequestError, match='attachment_prepare_failed'):
+        rt.resolve_session('alice', 'root')

@@ -19,10 +19,46 @@ PUBLIC_SYMBOLS = (
 )
 
 
-def available(api):
-    return all(callable(getattr(api, name, None)) for name in PUBLIC_SYMBOLS) and all(
+LEGACY_SESSION_DB_METHODS = (
+    'get_session', 'resolve_resume_session_id', 'get_compression_chain', 'get_compression_lineage',
+)
+
+
+def _has_persistence_reader(api):
+    return callable(getattr(api, 'open_persistence_reader', None))
+
+
+def _has_legacy_session_db(api):
+    return all(
         callable(getattr(getattr(api, 'SessionDB', None), name, None))
-        for name in ('get_session', 'resolve_resume_session_id', 'get_compression_chain', 'get_compression_lineage'))
+        for name in LEGACY_SESSION_DB_METHODS
+    )
+
+
+def available(api):
+    return all(callable(getattr(api, name, None)) for name in PUBLIC_SYMBOLS) and (
+        _has_persistence_reader(api) or _has_legacy_session_db(api)
+    )
+
+
+class _PersistenceLineageReader:
+    """Read-only adapter over Hermes 0.23.3+ ``persistence_assembly.open_persistence_reader``."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def get_session(self, session_id):
+        record = self._store.sessions.get(session_id)
+        return None if record is None else record.as_session_row()
+
+    def resolve_resume_session_id(self, session_id):
+        return str(self._store.lineage.resolve_resume_target(session_id))
+
+    def get_compression_chain(self, session_id):
+        return [str(sid) for sid in self._store.lineage.chain(session_id)]
+
+    def get_compression_lineage(self, session_id):
+        return [str(sid) for sid in self._store.lineage.lineage(session_id)]
 
 
 class FileRuntime:
@@ -46,6 +82,21 @@ class FileRuntime:
         path = self.home(profile) / 'state.db'
         if not path.is_file() or path.is_symlink():
             raise RequestError(404, 'attachment_not_found')
+        if _has_persistence_reader(self.api):
+            stack = contextlib.ExitStack()
+            try:
+                store = stack.enter_context(self.api.open_persistence_reader(path))
+                ready = getattr(store, 'ready', None)
+                if callable(ready):
+                    ready()
+            except Exception:
+                stack.close()
+                raise RequestError(502, 'attachment_prepare_failed') from None
+            try:
+                yield _PersistenceLineageReader(store)
+            finally:
+                stack.close()
+            return
         try:
             db = self.api.SessionDB(path, read_only=True)
         except Exception:
