@@ -148,3 +148,18 @@ def test_sweep_reclaims_only_unused_profile_copies_and_retains_original(tmp_path
     with s.connection() as db:
         assert db.execute('SELECT COUNT(*) FROM copies').fetchone()[0] == 0
     assert s.read_file(f['id']) == b'%PDF-1.4\noriginal'
+
+
+def test_read_file_preserves_binary_bytes_and_refuses_symlinks_without_o_nofollow(tmp_path, monkeypatch):
+    """Windows lacks os.O_NOFOLLOW and opens os.open in text mode without os.O_BINARY."""
+    s = store(tmp_path)
+    payload = b'%PDF-1.4\r\n\x00\x1aEOF\r\n\xffbinary'
+    f, _ = s.store_file('dm', 'bin-req', 'doc.pdf', 'application/pdf', [payload])
+    assert s.read_file(f['id']) == payload
+
+    # Simulate symlink detection when OS lacks O_NOFOLLOW
+    target = s.blob_path(f['id'])
+    orig_is_symlink = type(target).is_symlink
+    monkeypatch.setattr(type(target), 'is_symlink', lambda self: True if self == target else orig_is_symlink(self))
+    with pytest.raises(RequestError, match='attachment_not_found'):
+        s.read_file(f['id'])

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import stat
 import time
 import uuid
 
@@ -139,9 +140,14 @@ class FileStore:
         with self.connection() as db:
             row = self._row(db, file_id)
             path = self.blob_path(file_id)
+            if path.is_symlink():
+                raise RequestError(404, 'attachment_not_found')
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+                fd = os.open(path, flags)
                 with os.fdopen(fd, 'rb') as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        raise RequestError(404, 'attachment_not_found')
                     data = stream.read(MAX_BYTES + 1)
             except OSError:
                 raise RequestError(404, 'attachment_not_found') from None
