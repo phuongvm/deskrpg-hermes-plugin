@@ -16,6 +16,7 @@
 (`cron.cron_scope`) 안에서 불러야 한다 — `get_cron_output_dir()` 은 현재 스코프의 홈을 본다.
 """
 
+import contextlib
 import logging
 import time
 from datetime import datetime
@@ -40,13 +41,60 @@ EXECUTIONS_DB_RELPATH = Path("cron") / "executions.db"
 _OUTPUT_FILE_TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"  # cron/jobs.py save_job_output 의 파일명
 
 
+class _PersistenceSessionReader:
+    """Read-only adapter over Hermes 0.23.3+ ``persistence_assembly.open_persistence_reader``.
+
+    Exposes the read-only methods DeskRPG callers use (``list_cron_job_runs``, ``get_messages``,
+    ``get_session``, ``close``, ``read_only = True``) so callers work identically across legacy
+    ``hermes_state.SessionDB`` and the new storage interface.
+    """
+
+    read_only = True
+
+    def __init__(self, api, db_path: Path):
+        self._api = api
+        self._stack = contextlib.ExitStack()
+        try:
+            self._store = self._stack.enter_context(api.open_persistence_reader(Path(db_path)))
+        except BaseException:
+            self._stack.close()
+            raise
+
+    def list_cron_job_runs(self, job_id, limit=RUNS_LIMIT_DEFAULT, offset=0):
+        window = self._api.SessionWindow(limit=limit, offset=offset)
+        return [entry.as_cron_row() for entry in self._store.sessions.list_cron_job_runs(job_id, window)]
+
+    def get_messages(self, session_id, include_compacted=False, include_inactive=False, **_kwargs):
+        tv = self._api.TranscriptView
+        view = tv.ALL if include_inactive else (tv.DISPLAY if include_compacted else tv.ACTIVE)
+        request = self._api.TranscriptRead(view=view)
+        return [row.as_wire_row() for row in self._store.messages.read_transcript(session_id, request)]
+
+    def get_session(self, session_id):
+        record = self._store.sessions.get(session_id)
+        return None if record is None else record.as_session_row()
+
+    def close(self):
+        self._stack.close()
+
+
 def open_session_db(api, profile_home):
     """`<profile_home>/state.db` 를 **읽기 전용**으로 연다. 호출자가 `close()` 한다.
 
-    쓰기 모드로 열면 Hermes 가 스키마 마이그레이션·WAL 전환을 시도한다 — 게이트웨이의 다른
-    프로세스가 쓰고 있는 파일을 우리가 건드릴 이유가 없다.
+    Hermes 0.23.3+ 에서는 공식 스토리지 인터페이스(`persistence_assembly.open_persistence_reader`)
+    를 우선 사용하고, 구버전 Hermes 또는 테스트 fake 에서는 기존 `api.SessionDB(..., read_only=True)`
+    로 폴백한다. 쓰기 모드로 열면 Hermes 가 스키마 마이그레이션·WAL 전환을 시도한다 — 게이트웨이의
+    다른 프로세스가 쓰고 있는 파일을 우리가 건드릴 이유가 없다.
     """
-    return api.SessionDB(Path(profile_home) / STATE_DB_FILENAME, read_only=True)
+    db_path = Path(profile_home) / STATE_DB_FILENAME
+    if (
+        callable(getattr(api, "open_persistence_reader", None))
+        and getattr(api, "SessionWindow", None) is not None
+        and getattr(api, "TranscriptRead", None) is not None
+        and getattr(api, "TranscriptView", None) is not None
+    ):
+        return _PersistenceSessionReader(api, db_path)
+    return api.SessionDB(db_path, read_only=True)
 
 
 def executions_db_exists(profile_home) -> bool:

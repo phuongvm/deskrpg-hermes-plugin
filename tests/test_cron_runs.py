@@ -236,3 +236,102 @@ async def test_runs_는_장부_읽기_실패에도_이력을_준다(aiohttp_clie
     resp = await client.get("/p/sophie/deskrpg/cron/jobs/j1/runs")
     assert resp.status == 200
     assert (await resp.json())["runs"][0]["status"] == "unknown"
+
+
+def test_open_session_db_uses_persistence_reader_when_available(tmp_path):
+    """Hermes 0.23.3+ removed list_cron_job_runs from hermes_state.SessionDB; prefer persistence_assembly."""
+    import contextlib
+    import types
+
+    events = []
+
+    class FakeCronEntry:
+        def __init__(self, row):
+            self._row = row
+
+        def as_cron_row(self):
+            return dict(self._row)
+
+    class FakeWireRow:
+        def __init__(self, row):
+            self._row = row
+
+        def as_wire_row(self):
+            return dict(self._row)
+
+    class FakeSessionRecord:
+        def __init__(self, row):
+            self._row = row
+
+        def as_session_row(self):
+            return dict(self._row)
+
+    class FakeSessionsRepo:
+        def list_cron_job_runs(self, job_id, window):
+            events.append(("list_cron_job_runs", job_id, window.limit, window.offset))
+            return (FakeCronEntry({"id": f"cron_{job_id}_1", "started_at": 1700000000.0, "source": "cron"}),)
+
+        def get(self, session_id):
+            events.append(("get", session_id))
+            return FakeSessionRecord({"id": session_id, "source": "cron"})
+
+    class FakeMessagesRepo:
+        def read_transcript(self, session_id, request):
+            events.append(("read_transcript", session_id, request.view))
+            return (FakeWireRow({"role": "assistant", "content": "ok via persistence"}),)
+
+    class FakeWindow:
+        def __init__(self, limit=20, offset=0):
+            self.limit = limit
+            self.offset = offset
+
+    class FakeTranscriptView:
+        ACTIVE = "active"
+        DISPLAY = "display"
+        ALL = "all"
+
+    class FakeTranscriptRead:
+        def __init__(self, view):
+            self.view = view
+
+    @contextlib.contextmanager
+    def fake_open_reader(db_path):
+        events.append(("open", str(db_path)))
+        try:
+            yield types.SimpleNamespace(sessions=FakeSessionsRepo(), messages=FakeMessagesRepo())
+        finally:
+            events.append(("close", str(db_path)))
+
+    def legacy_should_not_be_called(*_a, **_kw):
+        raise AssertionError("legacy SessionDB must not be called when persistence reader is available")
+
+    api = types.SimpleNamespace(
+        SessionDB=legacy_should_not_be_called,
+        open_persistence_reader=fake_open_reader,
+        SessionWindow=FakeWindow,
+        TranscriptRead=FakeTranscriptRead,
+        TranscriptView=FakeTranscriptView,
+    )
+
+    sdb = cron_results.open_session_db(api, tmp_path)
+    try:
+        assert sdb.read_only is True
+        rows = sdb.list_cron_job_runs("j1", limit=7, offset=1)
+        assert rows == [{"id": "cron_j1_1", "started_at": 1700000000.0, "source": "cron"}]
+        assert sdb.get_messages("cron_j1_1") == [{"role": "assistant", "content": "ok via persistence"}]
+        assert sdb.get_messages("cron_j1_1", include_compacted=True) == [
+            {"role": "assistant", "content": "ok via persistence"}
+        ]
+        assert sdb.get_session("cron_j1_1") == {"id": "cron_j1_1", "source": "cron"}
+    finally:
+        sdb.close()
+
+    expected_db = str(tmp_path / "state.db")
+    assert events == [
+        ("open", expected_db),
+        ("list_cron_job_runs", "j1", 7, 1),
+        ("read_transcript", "cron_j1_1", "active"),
+        ("read_transcript", "cron_j1_1", "display"),
+        ("get", "cron_j1_1"),
+        ("close", expected_db),
+    ]

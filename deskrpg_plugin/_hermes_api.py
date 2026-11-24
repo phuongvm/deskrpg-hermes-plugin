@@ -273,6 +273,11 @@ OPTIONAL_SPEC = (
     ("agent.skill_commands", ("build_skill_invocation_message", "build_stacked_skill_invocation_message",
                               "resolve_skill_command_key", "get_skill_commands")),
     ("agent.skill_utils", ("get_disabled_skill_names",)),
+    # Hermes 0.23.3+ storage interface replacing deprecated hermes_state.SessionDB (removed in v0.27.0).
+    # Kept optional so older Hermes releases (<0.23.3) continue falling back to hermes_state.SessionDB.
+    ("persistence_assembly", ("open_persistence_reader",)),
+    ("persistence.conversation.sessions", ("SessionWindow",)),
+    ("persistence.conversation.messages", ("TranscriptRead", "TranscriptView")),
 )
 
 def _pairs(names):

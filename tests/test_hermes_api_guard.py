@@ -17,7 +17,7 @@ def _install(monkeypatch, missing=(), skip_modules=()):
     이미 import 해 뒀다면 캐시에서 그대로 나온다. 그러면 "모듈이 없을 때" 를
     검증한다는 이 테스트가 조용히 반대를 통과시킨다 — 실제로 CI 에서 그렇게 깨졌다.
     """
-    for pkg in ("hermes_cli", "cron", "gateway", "gateway.platforms"):
+    for pkg in ("hermes_cli", "cron", "gateway", "gateway.platforms", "persistence", "persistence.conversation"):
         monkeypatch.setitem(sys.modules, pkg, types.ModuleType(pkg))
     made = {}  # 한 모듈이 SPEC 과 OPTIONAL_SPEC 에 함께 나오면(hermes_constants) 같은 가짜에 더한다
     for module_path, names in (*_hermes_api.SPEC, *_hermes_api.OPTIONAL_SPEC):
